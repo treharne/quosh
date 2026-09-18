@@ -8,7 +8,7 @@ Root `quosh-server` on UDP 443 + Unix socket. `quosh user@host` creates a login 
 
 ## Slice 2 — prediction
 
-Mosh-parity aim. Shared predictor against confirmed `FrameState`. `PredictionEngine` in the Mosh tree is the spec; `prediction-unicode.test` is the e2e idea to port. Disable switch. Not a vim gate.
+Adaptive-only local prediction via the shared `quosh-predict` crate. Design and status: [12-prediction.md](12-prediction.md). `PredictionEngine` in the Mosh tree is the behavioural spec; `prediction-unicode.test` is covered by the differential oracle, not a vim gate.
 
 ## Slice 3 — PWA
 

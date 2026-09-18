@@ -20,7 +20,8 @@ Canonical spec: [docs/11-v1-spec.md](docs/11-v1-spec.md).
 4. [Architecture](docs/02-architecture.md)
 5. [Protocol concepts](docs/03-protocol.md)
 6. [Plan](docs/05-plan.md)
-7. Historical research: [candidates](docs/04-candidates.md), [Mosh](docs/07-mosh-reference.md), [Blit](docs/08-blit-and-transports.md), [identity](docs/09-transport-and-server-identity.md), [reuse notes](docs/10-reuse-and-remaining-decisions.md)
+7. [Local prediction](docs/12-prediction.md)
+8. Historical research: [candidates](docs/04-candidates.md), [Mosh](docs/07-mosh-reference.md), [Blit](docs/08-blit-and-transports.md), [identity](docs/09-transport-and-server-identity.md), [reuse notes](docs/10-reuse-and-remaining-decisions.md)
 
 ## v1 in one page
 

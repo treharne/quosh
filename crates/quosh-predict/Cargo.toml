@@ -1,0 +1,13 @@
+[package]
+name = "quosh-predict"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blit-remote.workspace = true
+vte.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+quosh-server = { path = "../quosh-server" }

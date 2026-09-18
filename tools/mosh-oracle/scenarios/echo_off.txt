@@ -1,0 +1,22 @@
+# Password / echo-off: the server accepts input frames but never echoes them.
+# Nothing may appear on screen, and predictions must never be confirmed.
+RTT 250
+FEED 50617373776f72643a20
+KEY 73
+EARLY 1
+LATE 1
+KEY 65
+EARLY 2
+LATE 2
+KEY 63
+EARLY 3
+LATE 3
+KEY 72
+EARLY 4
+LATE 4
+KEY 65
+EARLY 5
+LATE 5
+KEY 74
+EARLY 6
+LATE 6
