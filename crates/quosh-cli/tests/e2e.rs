@@ -90,6 +90,10 @@ impl UdpProxy {
         self.blackhole.store(true, Ordering::SeqCst);
     }
 
+    fn blackhole_off(&self) {
+        self.blackhole.store(false, Ordering::SeqCst);
+    }
+
     fn set_delay(&self, d: Duration) {
         self.delay_ms.store(d.as_millis() as u64, Ordering::SeqCst);
     }
@@ -716,4 +720,51 @@ async fn cli_quit_sequence_exits() {
         .expect("wait");
     assert_eq!(st.code(), Some(0), "clean quit expected, got {st:?}");
     assert!(cli.icanon(), "RawMode drop must restore ICANON");
+}
+
+/// The outage banner must stay on screen, not flash once per second and be
+/// wiped by the next predictor tick. An active prediction keeps ticks running
+/// during the blackhole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_outage_banner_persists_across_ticks() {
+    let stack = Stack::start().await;
+    let mut cli = CliPty::spawn(&stack);
+    let id = wait_session(&stack, Duration::from_secs(8)).await;
+    wait_attached(&stack, id, Duration::from_secs(8)).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Warm the epoch so the next keystroke produces an active prediction.
+    cli.write(b"w");
+    cli.wait_for("w", Duration::from_secs(8)).await;
+    stack.proxy.set_delay(Duration::from_millis(400));
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    cli.write(b"Z");
+    cli.wait_for_within("Z", Duration::from_millis(400)).await;
+
+    // Cut the link. The prediction stays pending, so 50 ms ticks keep running
+    // between the 1 s banner updates.
+    stack.proxy.blackhole();
+    let shown = cli
+        .wait_until(Duration::from_secs(8), |o| {
+            last_repaint(o).contains("seconds without network")
+        })
+        .await;
+    assert!(
+        shown,
+        "outage banner never appeared; output:\n{}",
+        cli.output()
+    );
+
+    // Several ticks later the banner must still be the most recent thing drawn.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    cli.pump();
+    assert!(
+        last_repaint(&cli.output()).contains("seconds without network"),
+        "banner was wiped by a predictor tick; output tail:\n{}",
+        last_repaint(&cli.output())
+    );
+
+    stack.proxy.blackhole_off();
+    stack.proxy.set_delay(Duration::ZERO);
+    let _ = tokio::time::timeout(Duration::from_secs(8), cli.child.wait()).await;
 }

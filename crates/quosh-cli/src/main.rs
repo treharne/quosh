@@ -453,9 +453,10 @@ struct Render {
     predictor: Predictor,
     screen: Option<Screen>,
     display: Option<FrameState>,
-    /// The outage banner is drawn outside `display`, so a repaint must not be
-    /// skipped while it is on screen.
-    banner_shown: bool,
+    /// When `Some`, the outage banner is drawn over the frame on every repaint.
+    outage: Option<Duration>,
+    /// The banner text currently on screen, so an unchanged one is not redrawn.
+    shown_banner: Option<String>,
     start: Instant,
 }
 
@@ -471,7 +472,8 @@ impl Render {
             predictor,
             screen: None,
             display: None,
-            banner_shown: false,
+            outage: None,
+            shown_banner: None,
             start: Instant::now(),
         }
     }
@@ -511,6 +513,8 @@ impl Render {
         self.predictor.set_local_frame_late_acked(applied.echo_ack);
         self.predictor.cull(&applied.frame, now);
         self.screen = Some(applied);
+        // A frame arriving means connectivity is back; drop the banner.
+        self.outage = None;
         self.repaint()?;
         Ok(Some((version, mode)))
     }
@@ -559,25 +563,33 @@ impl Render {
         };
         let mut frame = screen.frame.clone();
         self.predictor.apply(&mut frame);
+        let banner = self.outage.map(banner_line);
         // Predictions are always generated, but on a fast link `apply` leaves
         // the frame unchanged. Skip the write so timer ticks are silent, unless
-        // the banner has to be cleared from the screen.
-        if !self.banner_shown && self.display.as_ref() == Some(&frame) {
+        // the banner text changed (including appearing or clearing).
+        if self.display.as_ref() == Some(&frame) && self.shown_banner == banner {
             return Ok(());
         }
-        paint_frame(&frame, true)?;
+        let rows = frame.rows();
+        paint_frame(&frame, banner.is_none())?;
+        if let Some(line) = &banner {
+            write_banner(rows, line)?;
+        }
         self.display = Some(frame);
-        self.banner_shown = false;
+        self.shown_banner = banner;
         Ok(())
     }
 
-    fn show_banner(&mut self, elapsed: Duration) -> io::Result<()> {
-        let frame = self
-            .display
-            .clone()
-            .or_else(|| self.screen.as_ref().map(|s| s.frame.clone()));
-        paint_banner(elapsed, frame.as_ref())?;
-        self.banner_shown = true;
+    /// Show (or update) the outage banner. It stays until [`clear_outage`].
+    fn set_outage(&mut self, elapsed: Duration) -> io::Result<()> {
+        self.outage = Some(elapsed);
+        self.repaint()
+    }
+
+    fn clear_outage(&mut self) -> io::Result<()> {
+        if self.outage.take().is_some() {
+            self.repaint()?;
+        }
         Ok(())
     }
 }
@@ -629,9 +641,9 @@ async fn run_session(
                         if raw.is_none() {
                             raw = Some(RawMode::enter()?);
                         }
-                        // Restore the current confirmed frame (no predictions)
-                        // before resuming, e.g. after a reconnect.
-                        render.repaint()?;
+                        // Restore the current confirmed frame (no banner, no
+                        // predictions) before resuming, e.g. after a reconnect.
+                        render.clear_outage()?;
                         match session_loop(
                             conn,
                             session_id,
@@ -672,7 +684,7 @@ async fn run_session(
                         if raw.is_none() {
                             eprintln!("quosh: connect failed: {e:#}");
                         } else if last_ok.elapsed() > Duration::from_secs(OUTAGE_BANNER_SECS) {
-                            let _ = render.show_banner(last_ok.elapsed());
+                            let _ = render.set_outage(last_ok.elapsed());
                         }
                         connect_fut = start_connect(url.clone(), hash, true);
                     }
@@ -713,7 +725,7 @@ async fn run_session(
             }
             _ = tokio::time::sleep(Duration::from_secs(1)) => {
                 if last_ok.elapsed() > Duration::from_secs(OUTAGE_BANNER_SECS) {
-                    let _ = render.show_banner(last_ok.elapsed());
+                    let _ = render.set_outage(last_ok.elapsed());
                 }
             }
         }
@@ -802,7 +814,6 @@ async fn session_loop(
     let exit_code = &mut *live.exit_code;
     let bytes_rx = &mut *live.bytes_rx;
     let ctrl_rx = &mut *live.ctrl_rx;
-    let mut showing_outage = false;
     let (mut send, mut recv) = conn.open_bi().await.context("open control")?;
     let mut feed = FrameFeed::default();
     let _ = feed.push_ctrl(
@@ -846,7 +857,6 @@ async fn session_loop(
                         if let Some((version, mode)) = render.apply_screen(s)? {
                             pending_ack = Some(version);
                             apply_modes(mode, &mut last_mode);
-                            showing_outage = false;
                         }
                     }
                 }
@@ -862,10 +872,7 @@ async fn session_loop(
                         render.set_rtt_ms(srtt);
                     }
                     *last_ok = Instant::now();
-                    if showing_outage {
-                        render.repaint()?;
-                        showing_outage = false;
-                    }
+                    render.clear_outage()?;
                 }
                 MSG_EXIT => {
                     let st = decode_exit(&payload)?;
@@ -905,7 +912,6 @@ async fn session_loop(
                         {
                             pending_ack = Some(version);
                             apply_modes(mode, &mut last_mode);
-                            showing_outage = false;
                         }
                     }
                     Err(_) => return if hello_ok { Ok(false) } else { Err(handshake_closed()) },
@@ -960,8 +966,7 @@ async fn session_loop(
                     ping_sent = Some(Instant::now());
                 }
                 if last_ok.elapsed() > Duration::from_secs(OUTAGE_BANNER_SECS) {
-                    let _ = render.show_banner(last_ok.elapsed());
-                    showing_outage = true;
+                    let _ = render.set_outage(last_ok.elapsed());
                 }
             }
         }
@@ -1037,17 +1042,16 @@ fn paint_frame(frame: &FrameState, show_cursor: bool) -> io::Result<()> {
     out.flush()
 }
 
-fn paint_banner(elapsed: Duration, frame: Option<&FrameState>) -> io::Result<()> {
-    if let Some(f) = frame {
-        paint_frame(f, false)?;
-    }
+fn banner_line(elapsed: Duration) -> String {
+    format!(
+        " quosh: {} seconds without network  [Ctrl-^ . to quit] ",
+        elapsed.as_secs()
+    )
+}
+
+fn write_banner(rows: u16, line: &str) -> io::Result<()> {
     let mut out = io::stdout();
-    let secs = elapsed.as_secs();
-    write!(
-        out,
-        "\x1b[s\x1b[{};1H\x1b[7m quosh: {secs} seconds without network  [Ctrl-^ . to quit] \x1b[0m\x1b[K\x1b[u",
-        frame.map(|f| f.rows()).unwrap_or(24)
-    )?;
+    write!(out, "\x1b[s\x1b[{rows};1H\x1b[7m{line}\x1b[0m\x1b[K\x1b[u")?;
     out.flush()
 }
 
