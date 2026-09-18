@@ -259,6 +259,7 @@ enum CtrlEvent {
     Winch,
     Interrupt,
     Hangup,
+    Failed(String),
 }
 
 const UNACKED_CAP: usize = 256 * 1024;
@@ -266,27 +267,50 @@ const UNACKED_CAP: usize = 256 * 1024;
 /// New open-file description so O_NONBLOCK does not leak onto stdout/stderr
 /// (those often share the tty's OFD with fd 0).
 fn open_tty_nonblock() -> io::Result<File> {
-    std::fs::OpenOptions::new()
+    let f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open("/dev/tty")
+        .open("/dev/tty")?;
+    // custom_flags is not enough on every Unix: AsyncFd requires O_NONBLOCK.
+    let fd = f.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(f)
 }
 
 async fn input_task(bytes: mpsc::Sender<Vec<u8>>, ctrl: mpsc::Sender<CtrlEvent>, tty: File) {
-    let Ok(afd) = AsyncFd::new(tty) else {
-        return;
+    let afd = match AsyncFd::new(tty) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = ctrl.send(CtrlEvent::Failed(format!("async tty: {e}"))).await;
+            return;
+        }
     };
     let mut sigwinch = match signal(SignalKind::window_change()) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => {
+            let _ = ctrl.send(CtrlEvent::Failed(format!("sigwinch: {e}"))).await;
+            return;
+        }
     };
     let mut sigint = match signal(SignalKind::interrupt()) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => {
+            let _ = ctrl.send(CtrlEvent::Failed(format!("sigint: {e}"))).await;
+            return;
+        }
     };
     let mut sighup = match signal(SignalKind::hangup()) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => {
+            let _ = ctrl.send(CtrlEvent::Failed(format!("sighup: {e}"))).await;
+            return;
+        }
     };
     let mut buf = [0u8; 4096];
     loop {
@@ -352,7 +376,7 @@ async fn run_session(
     mut rows: u16,
 ) -> Result<()> {
     let url = wt_url(host, port)?;
-    eprintln!("quosh: connecting to {url}");
+    eprintln!("quosh: connecting to {url} (UDP {port})");
     let mut raw: Option<RawMode> = None;
     let mut last_ok = Instant::now();
     let mut seq: u64 = 0;
@@ -436,9 +460,15 @@ async fn run_session(
             }
             ev = ctrl_rx.recv() => {
                 match ev {
-                    None | Some(CtrlEvent::Eof) | Some(CtrlEvent::Interrupt) | Some(CtrlEvent::Hangup) => {
+                    None => break Err(anyhow::anyhow!("input task exited")),
+                    Some(CtrlEvent::Failed(m)) => break Err(anyhow::anyhow!("input: {m}")),
+                    Some(CtrlEvent::Interrupt) | Some(CtrlEvent::Hangup) => {
                         hungup = true;
                     }
+                    Some(CtrlEvent::Eof) if raw.is_some() => {
+                        hungup = true;
+                    }
+                    Some(CtrlEvent::Eof) => {}
                     Some(CtrlEvent::Winch) => {
                         let (c, r) = tty_size();
                         cols = c;
@@ -656,6 +686,9 @@ async fn session_loop(
                         *hungup = true;
                         flush_bounded(&mut send, &mut feed, Duration::from_millis(400)).await;
                         return Ok(true);
+                    }
+                    Some(CtrlEvent::Failed(m)) => {
+                        bail!("input: {m}");
                     }
                     Some(CtrlEvent::Winch) => {
                         let (c, r) = tty_size();
