@@ -24,8 +24,7 @@ using namespace Overlay;
 static uint64_t g_now = 0;
 uint64_t timestamp( void ) { return g_now; }
 
-static void feed( Emulator& emu, const std::string& s ) {
-  Parser::UTF8Parser parser;
+static void feed( Emulator& emu, Parser::UTF8Parser& parser, const std::string& s ) {
   Parser::Actions actions;
   for ( unsigned char b : s ) {
     parser.input( (char)b, actions );
@@ -82,6 +81,7 @@ int main( int argc, char** argv ) {
     h = atoi( argv[2] );
   }
   Emulator emu( w, h );
+  Parser::UTF8Parser out_parser;
   PredictionEngine pred;
   pred.set_display_preference( PredictionEngine::Adaptive );
   pred.set_send_interval( 250 );
@@ -98,9 +98,12 @@ int main( int argc, char** argv ) {
       std::string hex;
       is >> hex;
       auto bytes = unhex( hex );
+      // One input message is one frame: every byte in it shares the same
+      // prediction expiration sequence (Mosh's process_user_input does the
+      // same for a single read).
+      pred.set_local_frame_sent( sent );
+      sent++;
       for ( auto b : bytes ) {
-        pred.set_local_frame_sent( sent );
-        sent++;
         pred.new_user_byte( (char)b, local );
       }
       render( emu, pred, local );
@@ -108,7 +111,7 @@ int main( int argc, char** argv ) {
       std::string hex;
       is >> hex;
       auto bytes = unhex( hex );
-      feed( emu, std::string( bytes.begin(), bytes.end() ) );
+      feed( emu, out_parser, std::string( bytes.begin(), bytes.end() ) );
       render( emu, pred, local );
     } else if ( cmd == "SENT" ) {
       is >> sent;

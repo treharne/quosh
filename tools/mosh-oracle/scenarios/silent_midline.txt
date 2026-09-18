@@ -1,0 +1,17 @@
+# Limitation, not a guarantee: once an epoch is confident (confirmed by echoed
+# typing), a silent application that begins without Enter/Escape keeps the
+# current epoch, so the next printable character can be drawn speculatively.
+# This is Mosh's behaviour; the fix is the --predict=never escape hatch, not an
+# ECHO-mode heuristic (readline echoes in user space).
+RTT 250
+FEED 2420
+KEY 61
+EARLY 1
+LATE 1
+FEED 61
+KEY 62
+EARLY 2
+LATE 2
+KEY 63
+EARLY 3
+LATE 3

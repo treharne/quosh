@@ -1,0 +1,11 @@
+# The application prints something else at the predicted position (e.g. a
+# completion or redraw). The prediction must be killed, not kept.
+RTT 250
+FEED 2420
+KEY 61
+EARLY 1
+LATE 1
+FEED 61
+KEY 63
+LATE 2
+FEED 78

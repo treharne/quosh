@@ -34,7 +34,7 @@ The first complete demo still needs CLI **and** Chrome. Build order:
 | Transport | One WebTransport endpoint for CLI and browser. No raw-QUIC dialect. No WebSocket. | — |
 | Screen sync | Last-state-wins. Versioned payloads. Prefer datagrams; reliable snapshot/resync when the frame does not fit. Stale versions dropped. | Ordered Blit diffs (rejected) |
 | Blit | Unmodified crates only. `blit-alacritty` for PTY→`FrameState`. Do not use `feed_compressed` as the sync engine. If a crate needs a patch, rewrite that layer. | Blit gateway/server/UI |
-| Prediction | Mosh-parity *aim* in slice 2. Disable switch. Not in slice 1. | — |
+| Prediction | Mosh-parity *aim* in slice 2. `--predict=adaptive\|never` disable switch. Not in slice 1. | — |
 | Platforms | Ubuntu server, macOS CLI, Chrome | iOS/Android PWA |
 | License | GNU GPLv3 | — |
 
@@ -92,15 +92,16 @@ WebTransport session to path `/quosh`.
 
 Hello with a known `session_id`+`token` attaches (or replaces a dead/previous transport for that token). Unknown id is an error; sessions are created only on the Unix socket.
 
-Input `seq` is strictly increasing from 1 per session. The server writes to the PTY in order and ignores `seq <= last_applied`. Reconnect resends unacked seqs. Do not replay after session destroy or server restart.
+Input `seq` is strictly increasing from 1 per session. The server writes to the PTY in order and ignores `seq <= last_applied`. Reconnect resends unacked seqs. Do not replay after session destroy or server restart. `InputAck` means the session owner accepted the message into its write queue; it is not proof the PTY write completed.
 
 ### Screen payload
 
 Uncompressed body, then LZ4 (size-prepended, as `lz4_flex::compress_prepend_size`):
 
 ```
-magic      b"QS1\0"
+magic      b"QS2\0"
 version    u64le
+echo_ack   u64le   (input seq whose effect this screen may be reconciled against)
 rows       u16le
 cols       u16le
 cursor_row u16le
@@ -165,9 +166,11 @@ If no successful communication for 3 seconds, show an elapsed-time banner on the
 - Dead daemon: clear error, no sudo.
 - No prediction, no PWA, no passkeys in this slice.
 
-## Prediction (slice 2, not built now)
+## Prediction (slice 2)
 
-Treat Mosh `PredictionEngine` (`reference/mosh/src/frontend/terminaloverlay.cc`) as the behavioral spec. Mosh has no prediction unit suite; `src/tests/prediction-unicode.test` is the UTF-8 local-echo regression to port as an e2e idea. Modes: adaptive / always / never. Must not predict echo-off/password.
+Shared transport-free port of Mosh `PredictionEngine` in `quosh-predict`; full design in [12-prediction.md](12-prediction.md). CLI modes: `--predict=adaptive|never` (default adaptive). The echo acknowledgement travels inside each screen snapshot (`echo_ack`), so an ack is never reconciled against a screen that does not reflect it. `prediction-unicode.test` is covered by the differential oracle against unmodified Mosh.
+
+Conservative prediction is not a confidentiality guarantee: the epoch gate prevents drawing unconfirmed input, including the common Enter-then-password case, but a confident epoch that starts silent input without an epoch-breaking byte can display a character until reconciliation. Use `--predict=never` when that matters.
 
 ## PWA (slice 3, not built now)
 

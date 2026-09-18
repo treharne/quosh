@@ -1,0 +1,12 @@
+# Delayed but matching echo.
+RTT 250
+FEED 2420
+KEY 61
+EARLY 1
+LATE 1
+FEED 61
+KEY 62
+TICK 100
+EARLY 2
+LATE 2
+FEED 62

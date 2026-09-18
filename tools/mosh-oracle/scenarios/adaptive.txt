@@ -1,0 +1,14 @@
+# Adaptive hysteresis: high RTT enables prediction, low RTT disables it again
+# once nothing is active.
+RTT 250
+FEED 2420
+KEY 61
+EARLY 1
+LATE 1
+FEED 61
+RTT 20
+TICK 1
+KEY 62
+RTT 250
+TICK 1
+KEY 63

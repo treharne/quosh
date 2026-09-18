@@ -408,11 +408,18 @@ impl Predictor {
         let width = display.cols();
         let (exp, epoch) = (self.local_frame_sent + 1, self.prediction_epoch);
         let overwrite = self.predict_overwrite;
-        let row = get_or_make_row(&mut self.overlays, row_num, width, epoch);
         if col0 == 0 {
             return;
         }
         let col = col0 - 1;
+        // Shifting cells we cannot move faithfully (overflow text, OSC 8 links)
+        // would corrupt the line, so decline rather than guess.
+        let to = if overwrite { col } else { width - 1 };
+        if unsupported_range(display, row_num, col, to) {
+            self.become_tentative();
+            return;
+        }
+        let row = get_or_make_row(&mut self.overlays, row_num, width, epoch);
         {
             let c = self.cursors.last_mut().unwrap();
             c.col = col;
@@ -475,15 +482,19 @@ impl Predictor {
         }
         let width = display.cols();
         let (exp, old_epoch) = (self.local_frame_sent + 1, self.prediction_epoch);
+        let overwrite = self.predict_overwrite;
+        let rightmost = if overwrite { col } else { width - 1 };
+        if unsupported_range(display, row_num, col, rightmost) {
+            self.become_tentative();
+            return;
+        }
         let at_last_col = col + 1 >= width;
         if at_last_col {
             self.become_tentative();
         }
         let epoch = self.prediction_epoch;
-        let overwrite = self.predict_overwrite;
         let row = get_or_make_row(&mut self.overlays, row_num, width, old_epoch);
 
-        let rightmost = if overwrite { col } else { width - 1 };
         let mut i = rightmost;
         loop {
             if i <= col {
@@ -569,6 +580,11 @@ impl Predictor {
             c.row
         };
         if row_num == height - 1 {
+            // Blanking removes overflow text, but we cannot clear OSC 8 links.
+            if row_has_link(display, row_num) {
+                self.become_tentative();
+                return;
+            }
             let row = get_or_make_row(&mut self.overlays, row_num, width, epoch);
             for cell in row.cells.iter_mut() {
                 cell.base.active = true;
@@ -787,6 +803,8 @@ fn set_cell(fb: &mut FrameState, row: u16, col: u16, cell: &[u8; CELL_SIZE]) {
     let cols = fb.cols();
     let i = index(cols, row, col);
     fb.cells_mut()[i..i + CELL_SIZE].copy_from_slice(cell);
+    let flat = row as usize * cols as usize + col as usize;
+    fb.overflow_mut().remove(&flat);
 }
 
 fn set_underline(fb: &mut FrameState, row: u16, col: u16) {
@@ -806,7 +824,7 @@ fn cell_text(cell: &[u8; CELL_SIZE]) -> String {
     if len == 0 {
         return " ".to_string();
     }
-    if len >= 7 {
+    if len >= 7 || len > 4 {
         return String::new();
     }
     String::from_utf8_lossy(&cell[8..8 + len]).into_owned()
@@ -840,10 +858,50 @@ fn make_blank_cell(src: &[u8; CELL_SIZE]) -> [u8; CELL_SIZE] {
     cell
 }
 
-/// Copy the rendition bits (blit `f0` plus inverse) without disturbing content.
+/// Copy the rendition bits — `f0`, the foreground/background value bytes, and
+/// the inverse flag — without disturbing the content length or wide flags.
 fn copy_renditions(dst: &mut [u8; CELL_SIZE], src: &[u8; CELL_SIZE]) {
     dst[0] = src[0];
+    dst[2..8].copy_from_slice(&src[2..8]);
     dst[1] = (dst[1] & 0b1111_1110) | (src[1] & 1);
+}
+
+/// A cell whose text lives in the overflow table (a width-1 grapheme with many
+/// combining marks). We cannot shift that text with the 12-byte cell alone.
+fn cell_is_overflow(cell: &[u8; CELL_SIZE]) -> bool {
+    ((cell[1] >> 3) & 7) == 7
+}
+
+fn has_link(fb: &FrameState, row: u16, col: u16) -> bool {
+    let links = fb.cell_links();
+    if links.is_empty() {
+        return false;
+    }
+    let i = row as usize * fb.cols() as usize + col as usize;
+    links.get(i).copied().unwrap_or(0) != 0
+}
+
+/// Refuse to predict across cells we cannot move faithfully.
+fn unsupported_range(fb: &FrameState, row: u16, from: u16, to: u16) -> bool {
+    if row >= fb.rows() || from > to {
+        return false;
+    }
+    let to = to.min(fb.cols().saturating_sub(1));
+    for c in from..=to {
+        if cell_is_overflow(&cell_bytes(fb, row, c)) || has_link(fb, row, c) {
+            return true;
+        }
+    }
+    false
+}
+
+fn row_has_link(fb: &FrameState, row: u16) -> bool {
+    for c in 0..fb.cols() {
+        if has_link(fb, row, c) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -933,6 +991,9 @@ mod tests {
 
     #[test]
     fn echo_off_input_is_never_displayed() {
+        // Fresh, unconfirmed predictor: nothing in the epoch is ever
+        // confirmed, so nothing is drawn. `oracle_password_after_enter` and
+        // `oracle_silent_midline` cover the confident and Enter cases.
         let confirmed = text_frame(&["Password: "], 0, 10);
         let mut pred = Predictor::new();
         pred.set_display_preference(DisplayPreference::Always);
@@ -950,13 +1011,89 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_hides_predictions_on_fast_links() {
+    fn adaptive_stops_displaying_when_the_link_speeds_up() {
+        // Warm up: confirm one character at high RTT so the epoch is confident.
         let confirmed = text_frame(&["$ "], 0, 2);
         let mut pred = Predictor::new();
         pred.set_display_preference(DisplayPreference::Adaptive);
+        pred.set_send_interval(250);
+        pred.set_local_frame_sent(0);
+        pred.new_user_byte(b'a', &confirmed, 0);
+        let echoed = text_frame(&["$ a"], 0, 3);
+        pred.set_local_frame_late_acked(1);
+        pred.cull(&echoed, 1);
+
+        // The link now looks fast and nothing is active, so the SRTT trigger
+        // must switch off even though the epoch is confident.
         pred.set_send_interval(20);
+        pred.cull(&echoed, 2);
+        pred.set_local_frame_sent(1);
+        pred.new_user_byte(b'b', &shown(&pred, &echoed), 3);
+        assert_eq!(row_text(&shown(&pred, &echoed), 0), "$ a");
+    }
+
+    #[test]
+    fn bytes_in_one_message_share_one_expiration() {
+        // Quosh assigns a sequence per input message, not per byte. Every
+        // prediction from a multi-byte message resolves on that one ack.
+        let confirmed = text_frame(&["$ "], 0, 2);
+        let mut pred = Predictor::new();
+        pred.set_display_preference(DisplayPreference::Always);
+        pred.set_send_interval(250);
+        pred.set_local_frame_sent(0);
+        pred.new_user_byte(b'a', &confirmed, 0);
+        let echoed = text_frame(&["$ a"], 0, 3);
+        pred.set_local_frame_late_acked(1);
+        pred.cull(&echoed, 1);
+
+        pred.set_local_frame_sent(1); // one message, one sequence
+        pred.new_user_byte(b'b', &shown(&pred, &echoed), 2);
+        let after_b = shown(&pred, &echoed);
+        pred.new_user_byte(b'c', &after_b, 2);
+        assert_eq!(row_text(&shown(&pred, &echoed), 0), "$ abc");
+
+        let echoed2 = text_frame(&["$ abc"], 0, 5);
+        pred.set_local_frame_late_acked(2);
+        pred.cull(&echoed2, 3);
+        assert_eq!(row_text(&shown(&pred, &echoed2), 0), "$ abc");
+    }
+
+    #[test]
+    fn renditions_copy_colors_and_inverse() {
+        let mut src = [0u8; CELL_SIZE];
+        src[0] = 0b0000_0101; // indexed fg and bg
+        src[1] = 1 | (3 << 3); // inverse, content length 3
+        src[2..8].copy_from_slice(&[7, 8, 9, 10, 11, 12]);
+        let mut dst = [0u8; CELL_SIZE];
+        dst[1] = (1 << 3) | (1 << 1); // content length 1, wide
+        dst[8] = b'x';
+        copy_renditions(&mut dst, &src);
+        assert_eq!(&dst[2..8], &src[2..8], "foreground/background values");
+        assert_eq!(dst[0], src[0]);
+        assert_eq!(dst[1] & 1, 1, "inverse copied");
+        assert_eq!((dst[1] >> 3) & 7, 1, "content length preserved");
+        assert_eq!(dst[1] & (1 << 1), 1 << 1, "wide flag preserved");
+    }
+
+    #[test]
+    fn overflow_target_declines_prediction() {
+        // A width-1 grapheme can live in the overflow table; the 12-byte cell
+        // alone cannot be shifted, so the predictor must decline, not corrupt.
+        let mut confirmed = text_frame(&["$ "], 0, 2);
+        let cols = confirmed.cols();
+        let i = index(cols, 0, 2);
+        confirmed.cells_mut()[i + 1] = 7 << 3; // content length 7 = overflow
+        confirmed
+            .overflow_mut()
+            .insert(2, "e\u{301}\u{302}".to_string());
+
+        let mut pred = Predictor::new();
+        pred.set_display_preference(DisplayPreference::Always);
+        pred.set_send_interval(250);
         pred.set_local_frame_sent(0);
         pred.new_user_byte(b'x', &confirmed, 0);
-        assert_eq!(row_text(&shown(&pred, &confirmed), 0), "$");
+        let out = shown(&pred, &confirmed);
+        assert_eq!(out.cell_content(0, 2), "e\u{301}\u{302}");
+        assert_eq!(row_text(&out, 0), "$ e\u{301}\u{302}");
     }
 }

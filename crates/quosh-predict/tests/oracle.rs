@@ -150,9 +150,11 @@ fn run_scenario(name: &str) {
                 );
             }
             "KEY" => {
+                // One input message is one frame, matching the oracle and the
+                // CLI's per-message sequence numbering.
+                pred.set_local_frame_sent(sent);
+                sent += 1;
                 for b in unhex(arg) {
-                    pred.set_local_frame_sent(sent);
-                    sent += 1;
                     pred.new_user_byte(b, &local, now);
                 }
                 compare_step(
@@ -207,4 +209,34 @@ fn oracle_cr() {
 #[test]
 fn oracle_echo_off() {
     run_scenario("echo_off");
+}
+
+#[test]
+fn oracle_glitch() {
+    run_scenario("glitch");
+}
+
+#[test]
+fn oracle_delay() {
+    run_scenario("delay");
+}
+
+#[test]
+fn oracle_mismatch() {
+    run_scenario("mismatch");
+}
+
+#[test]
+fn oracle_adaptive() {
+    run_scenario("adaptive");
+}
+
+#[test]
+fn oracle_password_after_enter() {
+    run_scenario("password_after_enter");
+}
+
+#[test]
+fn oracle_silent_midline() {
+    run_scenario("silent_midline");
 }

@@ -30,7 +30,7 @@ command that changes or renders state:
 | Command | Meaning |
 |---|---|
 | `FEED <hex>` | server output, fed to the authoritative emulator |
-| `KEY <hex>` | user keystrokes, one `new_user_byte` per byte |
+| `KEY <hex>` | one input message (one frame); every byte shares its sequence |
 | `SENT <n>` | set `local_frame_sent` |
 | `EARLY <n>` | set the transport ack |
 | `LATE <n>` | set the echo ack |

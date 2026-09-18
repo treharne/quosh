@@ -1,0 +1,12 @@
+# Glitch trigger in isolation: SRTT is low so srtt_trigger stays off, but a
+# prediction that stays pending past 250 ms is forced onto the display anyway.
+RTT 20
+FEED 2420
+KEY 61
+EARLY 1
+LATE 1
+FEED 61
+KEY 62
+TICK 100
+TICK 200
+TICK 400
