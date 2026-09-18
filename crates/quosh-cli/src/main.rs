@@ -10,8 +10,7 @@ use quosh_proto::{
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, IsTerminal, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
@@ -263,14 +262,15 @@ enum CtrlEvent {
 
 const UNACKED_CAP: usize = 256 * 1024;
 
-/// Separate open of `/dev/tty` so we never change O_NONBLOCK on fd 0/1
-/// (those often share one open-file description). macOS kqueue rejects
-/// `/dev/tty` with tokio `AsyncFd` (EINVAL), so the reader uses `poll(2)`.
-fn open_tty() -> io::Result<File> {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC)
-        .open("/dev/tty")
+/// Dup stdin for the input thread. Do not `F_SETFL O_NONBLOCK`: on a tty that
+/// flag is OFD-wide and would make stdout paints fail with EAGAIN. macOS also
+/// does not deliver keystrokes to a second `open("/dev/tty")`.
+fn dup_stdin() -> io::Result<File> {
+    let n = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 0) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(n) })
 }
 
 fn spawn_tty_reader(bytes: mpsc::Sender<Vec<u8>>, ctrl: mpsc::Sender<CtrlEvent>, tty: File) {
@@ -384,13 +384,13 @@ async fn run_session(
 
     let (bytes_tx, mut bytes_rx) = mpsc::channel::<Vec<u8>>(8);
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<CtrlEvent>(8);
-    match open_tty() {
+    match dup_stdin() {
         Ok(tty) => {
             spawn_tty_reader(bytes_tx, ctrl_tx.clone(), tty);
             tokio::spawn(signal_task(ctrl_tx));
         }
         Err(e) => {
-            bail!("open /dev/tty for input: {e}");
+            bail!("dup stdin for input: {e}");
         }
     }
 
