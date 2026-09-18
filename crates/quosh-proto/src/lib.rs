@@ -148,7 +148,7 @@ pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// Cap on LZ4-advertised uncompressed screen bytes (before we allocate).
 pub const MAX_SCREEN_RAW: usize = 8 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 32 * 1024;
-pub const SCREEN_MAGIC: &[u8; 4] = b"QS1\0";
+pub const SCREEN_MAGIC: &[u8; 4] = b"QS2\0";
 pub const MODE_CURSOR_VISIBLE: u16 = 1;
 pub const MODE_BRACKETED_PASTE: u16 = 1 << 3;
 /// Upper bound on a single axis. Together with [`MAX_CELL_COUNT`] this keeps
@@ -395,9 +395,14 @@ pub fn decode_error(p: &[u8]) -> Result<(u16, String)> {
 }
 
 /// Versioned screen. `version == 0` is never applied.
+///
+/// `echo_ack` is the input sequence this screen may be reconciled against. It
+/// travels with the frame so an acknowledgement is never applied to a screen
+/// that does not reflect it (see `docs/12-prediction.md`).
 #[derive(Clone, Debug)]
 pub struct Screen {
     pub version: u64,
+    pub echo_ack: u64,
     pub frame: FrameState,
 }
 
@@ -435,6 +440,7 @@ impl Screen {
         let mut w = Vec::new();
         w.write_all(SCREEN_MAGIC)?;
         w.write_all(&self.version.to_le_bytes())?;
+        w.write_all(&self.echo_ack.to_le_bytes())?;
         w.write_all(&self.frame.rows().to_le_bytes())?;
         w.write_all(&self.frame.cols().to_le_bytes())?;
         w.write_all(&self.frame.cursor_row().to_le_bytes())?;
@@ -469,6 +475,8 @@ impl Screen {
         let mut u64b = [0u8; 8];
         r.read_exact(&mut u64b).map_err(|_| Error::Truncated)?;
         let version = u64::from_le_bytes(u64b);
+        r.read_exact(&mut u64b).map_err(|_| Error::Truncated)?;
+        let echo_ack = u64::from_le_bytes(u64b);
         let mut u16b = [0u8; 2];
         let mut read_u16 = |r: &mut Cursor<&[u8]>| -> Result<u16> {
             r.read_exact(&mut u16b).map_err(|_| Error::Truncated)?;
@@ -526,7 +534,11 @@ impl Screen {
         if r.position() as usize != data.len() {
             return Err(Error::Frame);
         }
-        Ok(Self { version, frame })
+        Ok(Self {
+            version,
+            echo_ack,
+            frame,
+        })
     }
 }
 
@@ -729,20 +741,32 @@ mod tests {
         let frame = FrameState::from_parts(2, 2, 0, 1, 0, "t", vec![0u8; 2 * 2 * CELL_SIZE]);
         let s1 = Screen {
             version: 1,
+            echo_ack: 0,
             frame: frame.clone(),
         };
         let bytes = s1.encode_compressed().unwrap();
         let back = Screen::decode_compressed(&bytes).unwrap();
         assert_eq!(back.version, 1);
+        assert_eq!(back.echo_ack, 0);
         assert_eq!(back.frame.rows(), 2);
         assert_eq!(back.frame.title(), "t");
 
+        let s1_ack = Screen {
+            version: 1,
+            echo_ack: 7,
+            frame: frame.clone(),
+        };
+        let back = Screen::decode_compressed(&s1_ack.encode_compressed().unwrap()).unwrap();
+        assert_eq!(back.echo_ack, 7);
+
         let s2 = Screen {
             version: 2,
+            echo_ack: 0,
             frame: frame.clone(),
         };
         let s0 = Screen {
             version: 0,
+            echo_ack: 0,
             frame: frame.clone(),
         };
         assert!(Screen::apply_newer(Some(&s2), s1.clone()).is_none());
@@ -815,6 +839,7 @@ mod tests {
         let frame = FrameState::from_parts(300, 300, 0, 0, 0, "", cells);
         let blob = Screen {
             version: 1,
+            echo_ack: 0,
             frame,
         }
         .encode_compressed()
@@ -905,7 +930,11 @@ mod tests {
         assert!(Screen::decode_compressed(&bomb).is_err());
 
         let frame = FrameState::from_parts(2, 2, 0, 0, 0, "", vec![0u8; 2 * 2 * CELL_SIZE]);
-        let s = Screen { version: 1, frame };
+        let s = Screen {
+            version: 1,
+            echo_ack: 0,
+            frame,
+        };
         let mut raw = s.encode_raw().unwrap();
         raw.push(0);
         assert!(Screen::decode_raw(&raw).is_err());

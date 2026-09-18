@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail};
+use blit_remote::FrameState;
 use clap::{Parser, Subcommand};
+use quosh_predict::{DisplayPreference, Predictor};
 use quosh_proto::{
     CONNECT_PREFIX, DEFAULT_PORT, FrameFeed, Hello, HelloOk, HelperRequest, HelperResponse,
     MODE_BRACKETED_PASTE, MODE_CURSOR_VISIBLE, MSG_ERROR, MSG_EXIT, MSG_HELLO_OK, MSG_INPUT_ACK,
@@ -30,6 +32,9 @@ struct Args {
     /// SSH command used to reach the server (default: ssh).
     #[arg(long, default_value = "ssh")]
     ssh: String,
+    /// Local echo prediction: adaptive (default) or never.
+    #[arg(long, value_enum, default_value_t = PredictMode::Adaptive)]
+    predict: PredictMode,
     /// Unix socket (create-session helper only).
     #[arg(long, default_value = SOCKET, hide = true)]
     socket: PathBuf,
@@ -37,6 +42,12 @@ struct Args {
     cmd: Option<Cmd>,
     /// user@host (when not using a subcommand).
     target: Option<String>,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum PredictMode {
+    Adaptive,
+    Never,
 }
 
 #[derive(Subcommand, Debug)]
@@ -68,7 +79,7 @@ async fn main() -> Result<()> {
             let Some(target) = args.target else {
                 bail!("usage: quosh [--ssh=cmd] user@host");
             };
-            client(&args.ssh, &target).await
+            client(&args.ssh, &target, args.predict).await
         }
     }
 }
@@ -139,7 +150,7 @@ fn hex32(s: Option<&str>) -> Result<[u8; 32]> {
     v.try_into().map_err(|_| anyhow::anyhow!("hex32"))
 }
 
-async fn client(ssh: &str, target: &str) -> Result<()> {
+async fn client(ssh: &str, target: &str, predict: PredictMode) -> Result<()> {
     let (cols, rows) = tty_size();
     let mut create_args = vec![
         "create-session".to_string(),
@@ -189,18 +200,24 @@ async fn client(ssh: &str, target: &str) -> Result<()> {
         .to_string();
     let (port, hash, session_id, token) = parse_connect_line(&line)?;
     let host = ssh_hostname(ssh, target).await?;
-    run_session(&host, port, hash, session_id, token, cols, rows).await
+    run_session(
+        &host,
+        port,
+        hash,
+        session_id,
+        token,
+        cols,
+        rows,
+        predict == PredictMode::Never,
+    )
+    .await
 }
 
 /// Use OpenSSH's evaluated `HostName` so `Host agents` / Tailscale aliases
 /// match the SSH hop. Falling back to the name after `@` is wrong when that
 /// alias only exists in `~/.ssh/config`.
 async fn ssh_hostname(ssh: &str, target: &str) -> Result<String> {
-    let fallback = target
-        .rsplit('@')
-        .next()
-        .context("host")?
-        .to_string();
+    let fallback = target.rsplit('@').next().context("host")?.to_string();
     let mut parts: Vec<String> = ssh.split_whitespace().map(str::to_string).collect();
     if parts.is_empty() {
         return Ok(fallback);
@@ -363,6 +380,134 @@ async fn signal_task(ctrl: mpsc::Sender<CtrlEvent>) {
     }
 }
 
+const PASTE_BYTES: usize = 100;
+
+/// Owns the confirmed screen, the predictor, and the last displayed frame.
+/// Every repaint starts from confirmed state and reapplies predictions.
+struct Render {
+    predictor: Predictor,
+    screen: Option<Screen>,
+    display: Option<FrameState>,
+    start: Instant,
+}
+
+impl Render {
+    fn new(never: bool) -> Self {
+        let mut predictor = Predictor::new();
+        predictor.set_display_preference(if never {
+            DisplayPreference::Never
+        } else {
+            DisplayPreference::Adaptive
+        });
+        Self {
+            predictor,
+            screen: None,
+            display: None,
+            start: Instant::now(),
+        }
+    }
+
+    fn now(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+
+    /// Mosh's `send_interval`: `clamp(ceil(SRTT / 2), 20, 250)` ms.
+    fn set_rtt_ms(&mut self, srtt_ms: f64) {
+        let interval = ((srtt_ms / 2.0).ceil() as u32).clamp(20, 250);
+        self.predictor.set_send_interval(interval);
+    }
+
+    fn reset(&mut self) {
+        self.predictor.reset();
+        self.display = None;
+    }
+
+    fn tick_delay(&self) -> Option<Duration> {
+        if self.predictor.active() {
+            Some(Duration::from_millis(50))
+        } else {
+            None
+        }
+    }
+
+    /// Install a screen atomically: frame, echo checkpoint, cull, repaint.
+    /// Returns `(version, mode)` when the screen was newer.
+    fn apply_screen(&mut self, incoming: Screen) -> io::Result<Option<(u64, u16)>> {
+        let Some(applied) = Screen::apply_newer(self.screen.as_ref(), incoming) else {
+            return Ok(None);
+        };
+        let now = self.now();
+        let version = applied.version;
+        let mode = applied.frame.mode();
+        self.predictor.set_local_frame_late_acked(applied.echo_ack);
+        self.predictor.cull(&applied.frame, now);
+        self.screen = Some(applied);
+        self.repaint()?;
+        Ok(Some((version, mode)))
+    }
+
+    /// Feed the bytes of one input message. All bytes share `seq` (the
+    /// message's frame), and bulk reads are not predicted.
+    ///
+    /// The predictor expires a prediction at `local_frame_sent + 1` (Mosh's
+    /// convention), so message `seq` is fed as `seq - 1` to expire at `seq`,
+    /// matching the server's echo checkpoint exactly.
+    fn predict(&mut self, seq: u64, bytes: &[u8]) -> io::Result<()> {
+        if bytes.len() > PASTE_BYTES {
+            self.predictor.reset();
+            return Ok(());
+        }
+        let Some(screen) = self.screen.as_ref() else {
+            return Ok(());
+        };
+        self.predictor.set_local_frame_sent(seq.saturating_sub(1));
+        let now = self.start.elapsed().as_millis() as u64;
+        for &b in bytes {
+            let basis = self.display.as_ref().unwrap_or(&screen.frame);
+            self.predictor.new_user_byte(b, basis, now);
+        }
+        self.repaint()
+    }
+
+    /// Time-based reconciliation: a prediction pending on a quiet link still
+    /// has to reach the glitch threshold and be redrawn.
+    fn tick(&mut self) -> io::Result<()> {
+        if !self.predictor.active() {
+            return Ok(());
+        }
+        if let Some(screen) = self.screen.as_ref() {
+            let now = self.now();
+            self.predictor.cull(&screen.frame, now);
+        }
+        self.repaint()
+    }
+
+    fn repaint(&mut self) -> io::Result<()> {
+        let Some(screen) = self.screen.as_ref() else {
+            return Ok(());
+        };
+        let mut frame = screen.frame.clone();
+        self.predictor.apply(&mut frame);
+        // Predictions are always generated, but on a fast link `apply` leaves
+        // the frame unchanged. Skip the write so timer ticks are silent.
+        if self.display.as_ref() == Some(&frame) {
+            return Ok(());
+        }
+        paint_frame(&frame, true)?;
+        self.display = Some(frame);
+        Ok(())
+    }
+
+    fn show_banner(&mut self, elapsed: Duration) -> io::Result<()> {
+        let frame = self
+            .display
+            .clone()
+            .or_else(|| self.screen.as_ref().map(|s| s.frame.clone()));
+        paint_banner(elapsed, frame.as_ref())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     host: &str,
     port: u16,
@@ -371,6 +516,7 @@ async fn run_session(
     token: [u8; 32],
     mut cols: u16,
     mut rows: u16,
+    never: bool,
 ) -> Result<()> {
     let url = wt_url(host, port)?;
     eprintln!("quosh: connecting to {url} (UDP {port})");
@@ -378,7 +524,7 @@ async fn run_session(
     let mut last_ok = Instant::now();
     let mut seq: u64 = 0;
     let mut unacked: Vec<(u64, Vec<u8>)> = Vec::new();
-    let mut screen: Option<Screen> = None;
+    let mut render = Render::new(never);
     let mut hungup = false;
     let mut exit_code = 0i32;
 
@@ -394,12 +540,12 @@ async fn run_session(
         }
     }
 
-    let mut showing_outage = false;
     let mut connect_fut = start_connect(url.clone(), hash, false);
     let result: Result<()> = loop {
         if hungup {
             break Ok(());
         }
+        let tick = render.tick_delay();
         tokio::select! {
             c = &mut connect_fut => {
                 match c {
@@ -408,12 +554,9 @@ async fn run_session(
                         if raw.is_none() {
                             raw = Some(RawMode::enter()?);
                         }
-                        if showing_outage {
-                            if let Some(s) = screen.as_ref() {
-                                let _ = paint(s, true);
-                            }
-                            showing_outage = false;
-                        }
+                        // Restore the current confirmed frame (no predictions)
+                        // before resuming, e.g. after a reconnect.
+                        render.repaint()?;
                         match session_loop(
                             conn,
                             session_id,
@@ -423,14 +566,13 @@ async fn run_session(
                                 rows: &mut rows,
                                 seq: &mut seq,
                                 unacked: &mut unacked,
-                                screen: &mut screen,
                                 last_ok: &mut last_ok,
                                 hungup: &mut hungup,
                                 exit_code: &mut exit_code,
                                 bytes_rx: &mut bytes_rx,
                                 ctrl_rx: &mut ctrl_rx,
-                                showing_outage: &mut showing_outage,
                             },
+                            &mut render,
                         )
                         .await
                         {
@@ -443,14 +585,14 @@ async fn run_session(
                                 }
                             }
                         }
+                        render.reset();
                         connect_fut = start_connect(url.clone(), hash, false);
                     }
                     Err(e) => {
                         if raw.is_none() {
                             eprintln!("quosh: connect failed: {e:#}");
                         } else if last_ok.elapsed() > Duration::from_secs(OUTAGE_BANNER_SECS) {
-                            let _ = paint_banner(last_ok.elapsed(), screen.as_ref());
-                            showing_outage = true;
+                            let _ = render.show_banner(last_ok.elapsed());
                         }
                         connect_fut = start_connect(url.clone(), hash, true);
                     }
@@ -477,13 +619,21 @@ async fn run_session(
             b = bytes_rx.recv(), if unacked_bytes(&unacked) < UNACKED_CAP => {
                 if let Some(b) = b {
                     seq += 1;
+                    render.predict(seq, &b)?;
                     unacked.push((seq, b));
                 }
             }
+            _ = async {
+                match tick {
+                    Some(d) => tokio::time::sleep(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                render.tick()?;
+            }
             _ = tokio::time::sleep(Duration::from_secs(1)) => {
                 if last_ok.elapsed() > Duration::from_secs(OUTAGE_BANNER_SECS) {
-                    let _ = paint_banner(last_ok.elapsed(), screen.as_ref());
-                    showing_outage = true;
+                    let _ = render.show_banner(last_ok.elapsed());
                 }
             }
         }
@@ -549,13 +699,11 @@ struct Live<'a> {
     rows: &'a mut u16,
     seq: &'a mut u64,
     unacked: &'a mut Vec<(u64, Vec<u8>)>,
-    screen: &'a mut Option<Screen>,
     last_ok: &'a mut Instant,
     hungup: &'a mut bool,
     exit_code: &'a mut i32,
     bytes_rx: &'a mut mpsc::Receiver<Vec<u8>>,
     ctrl_rx: &'a mut mpsc::Receiver<CtrlEvent>,
-    showing_outage: &'a mut bool,
 }
 
 async fn session_loop(
@@ -563,18 +711,18 @@ async fn session_loop(
     session_id: [u8; 16],
     token: [u8; 32],
     live: &mut Live<'_>,
+    render: &mut Render,
 ) -> Result<bool> {
     let cols = &mut *live.cols;
     let rows = &mut *live.rows;
     let seq = &mut *live.seq;
     let unacked = &mut *live.unacked;
-    let screen = &mut *live.screen;
     let last_ok = &mut *live.last_ok;
     let hungup = &mut *live.hungup;
     let exit_code = &mut *live.exit_code;
     let bytes_rx = &mut *live.bytes_rx;
     let ctrl_rx = &mut *live.ctrl_rx;
-    let showing_outage = &mut *live.showing_outage;
+    let mut showing_outage = false;
     let (mut send, mut recv) = conn.open_bi().await.context("open control")?;
     let mut feed = FrameFeed::default();
     let _ = feed.push_ctrl(
@@ -594,6 +742,8 @@ async fn session_loop(
     let mut ping = tokio::time::interval(Duration::from_secs(1));
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_mode: u16 = 0;
+    let mut srtt_ms: Option<f64> = None;
+    let mut ping_sent: Option<Instant> = None;
 
     loop {
         while let Some((typ, payload)) = split_frame(&mut buf)? {
@@ -602,14 +752,13 @@ async fn session_loop(
                     let _ = HelloOk::decode(&payload)?;
                 }
                 MSG_SCREEN => {
-                    if let Ok(s) = Screen::decode_compressed(&payload)
-                        && let Some(applied) = Screen::apply_newer(screen.as_ref(), s)
-                    {
-                        pending_ack = Some(applied.version);
-                        apply_modes(applied.frame.mode(), &mut last_mode);
-                        paint(&applied, true)?;
-                        *showing_outage = false;
-                        *screen = Some(applied);
+                    if let Ok(s) = Screen::decode_compressed(&payload) {
+                        *last_ok = Instant::now();
+                        if let Some((version, mode)) = render.apply_screen(s)? {
+                            pending_ack = Some(version);
+                            apply_modes(mode, &mut last_mode);
+                            showing_outage = false;
+                        }
                     }
                 }
                 MSG_INPUT_ACK => {
@@ -617,12 +766,16 @@ async fn session_loop(
                     unacked.retain(|(s, _)| *s > ack);
                 }
                 MSG_PONG => {
+                    if let Some(t) = ping_sent.take() {
+                        let sample = t.elapsed().as_secs_f64() * 1000.0;
+                        let srtt = srtt_ms.map(|s| s * 0.75 + sample * 0.25).unwrap_or(sample);
+                        srtt_ms = Some(srtt);
+                        render.set_rtt_ms(srtt);
+                    }
                     *last_ok = Instant::now();
-                    if *showing_outage {
-                        if let Some(s) = screen.as_ref() {
-                            paint(s, true)?;
-                        }
-                        *showing_outage = false;
+                    if showing_outage {
+                        render.repaint()?;
+                        showing_outage = false;
                     }
                 }
                 MSG_EXIT => {
@@ -644,6 +797,7 @@ async fn session_loop(
             pending_ack = None;
         }
         pump_unacked(&mut feed, unacked, &mut sent_seq);
+        let tick = render.tick_delay();
         tokio::select! {
             n = recv.read(&mut tmp_recv) => {
                 let n = n?.unwrap_or(0);
@@ -658,13 +812,11 @@ async fn session_loop(
                     Ok(bytes) => {
                         *last_ok = Instant::now();
                         if let Ok(s) = Screen::decode_compressed(&bytes)
-                            && let Some(applied) = Screen::apply_newer(screen.as_ref(), s)
+                            && let Some((version, mode)) = render.apply_screen(s)?
                         {
-                            pending_ack = Some(applied.version);
-                            apply_modes(applied.frame.mode(), &mut last_mode);
-                            paint(&applied, true)?;
-                            *showing_outage = false;
-                            *screen = Some(applied);
+                            pending_ack = Some(version);
+                            apply_modes(mode, &mut last_mode);
+                            showing_outage = false;
                         }
                     }
                     Err(_) => return Ok(false),
@@ -699,14 +851,24 @@ async fn session_loop(
             b = bytes_rx.recv(), if unacked_bytes(unacked) < UNACKED_CAP => {
                 if let Some(b) = b {
                     *seq += 1;
+                    render.predict(*seq, &b)?;
                     unacked.push((*seq, b));
                 }
             }
+            _ = async {
+                match tick {
+                    Some(d) => tokio::time::sleep(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                render.tick()?;
+            }
             _ = ping.tick() => {
+                ping_sent = Some(Instant::now());
                 let _ = feed.push_ctrl(encode_ping());
                 if last_ok.elapsed() > Duration::from_secs(OUTAGE_BANNER_SECS) {
-                    let _ = paint_banner(last_ok.elapsed(), screen.as_ref());
-                    *showing_outage = true;
+                    let _ = render.show_banner(last_ok.elapsed());
+                    showing_outage = true;
                 }
             }
         }
@@ -748,16 +910,16 @@ fn apply_modes(mode: u16, last: &mut u16) {
     *last = mode;
 }
 
-fn paint(screen: &Screen, show_if_mode: bool) -> io::Result<()> {
+fn paint_frame(frame: &FrameState, show_cursor: bool) -> io::Result<()> {
     let mut buf = Vec::with_capacity(16 * 1024);
-    let cursor_on = show_if_mode && screen.frame.mode() & MODE_CURSOR_VISIBLE != 0;
+    let cursor_on = show_cursor && frame.mode() & MODE_CURSOR_VISIBLE != 0;
     buf.extend_from_slice(b"\x1b[?25l\x1b[H\x1b[2J");
-    buf.extend_from_slice(&frame_ansi(&screen.frame));
+    buf.extend_from_slice(&frame_ansi(frame));
     buf.extend_from_slice(
         format!(
             "\x1b[{};{}H",
-            screen.frame.cursor_row() + 1,
-            screen.frame.cursor_col() + 1
+            frame.cursor_row() + 1,
+            frame.cursor_col() + 1
         )
         .as_bytes(),
     );
@@ -782,16 +944,16 @@ fn paint(screen: &Screen, show_if_mode: bool) -> io::Result<()> {
     out.flush()
 }
 
-fn paint_banner(elapsed: Duration, screen: Option<&Screen>) -> io::Result<()> {
-    if let Some(s) = screen {
-        paint(s, false)?;
+fn paint_banner(elapsed: Duration, frame: Option<&FrameState>) -> io::Result<()> {
+    if let Some(f) = frame {
+        paint_frame(f, false)?;
     }
     let mut out = io::stdout();
     let secs = elapsed.as_secs();
     write!(
         out,
         "\x1b[s\x1b[{};1H\x1b[7m quosh: {secs} seconds without network \x1b[0m\x1b[K\x1b[u",
-        screen.map(|s| s.frame.rows()).unwrap_or(24)
+        frame.map(|f| f.rows()).unwrap_or(24)
     )?;
     out.flush()
 }

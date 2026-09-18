@@ -8,7 +8,7 @@ Root `quosh-server` on UDP 443 + Unix socket. `quosh user@host` creates a login 
 
 ## Slice 2 — prediction
 
-Adaptive-only local prediction via the shared `quosh-predict` crate. Design and status: [12-prediction.md](12-prediction.md). `PredictionEngine` in the Mosh tree is the behavioural spec; `prediction-unicode.test` is covered by the differential oracle, not a vim gate.
+Implemented: shared `quosh-predict` crate (adaptive/never), `echo_ack` in the QS2 screen payload, server-side write-completion checkpoints, and CLI wiring with RTT estimate and timer-driven reconciliation. Design and evidence: [12-prediction.md](12-prediction.md).
 
 ## Slice 3 — PWA
 

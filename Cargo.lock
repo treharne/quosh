@@ -1250,6 +1250,7 @@ dependencies = [
  "hex",
  "libc",
  "nix",
+ "quosh-predict",
  "quosh-proto",
  "quosh-server",
  "rand 0.9.5",

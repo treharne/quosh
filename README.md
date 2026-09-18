@@ -8,7 +8,7 @@ License: [GNU GPLv3](LICENSE).
 
 ## Status
 
-Implementation is underway. Slice 1 is the CLI session path (root daemon, `quosh user@host`, login shell, reconnect, hangup). Prediction and the PWA are not in this slice.
+Implementation is underway. Slice 1 (the CLI session path) is complete, and slice 2 (adaptive local prediction with `--predict=adaptive|never`) is wired through the client, protocol, and server. The PWA is not built yet.
 
 Canonical spec: [docs/11-v1-spec.md](docs/11-v1-spec.md).
 

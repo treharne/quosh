@@ -91,8 +91,7 @@ impl UdpProxy {
     }
 
     fn set_delay(&self, d: Duration) {
-        self.delay_ms
-            .store(d.as_millis() as u64, Ordering::SeqCst);
+        self.delay_ms.store(d.as_millis() as u64, Ordering::SeqCst);
     }
 
     fn set_drop_pct(&self, pct: u32) {
@@ -228,6 +227,10 @@ struct CliPty {
 
 impl CliPty {
     fn spawn(stack: &Stack) -> Self {
+        Self::spawn_args(stack, &[])
+    }
+
+    fn spawn_args(stack: &Stack, extra: &[&str]) -> Self {
         let bin = PathBuf::from(env!("CARGO_BIN_EXE_quosh"));
         let pty = open_cloexec(80, 24).expect("pty");
         let slave_fd = pty.slave.as_raw_fd();
@@ -241,8 +244,11 @@ impl CliPty {
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
         let mut cmd = Command::new(&bin);
-        cmd.arg(format!("--ssh={}", stack.fake_ssh.display()))
-            .arg("quoshtest@127.0.0.1")
+        cmd.arg(format!("--ssh={}", stack.fake_ssh.display()));
+        for a in extra {
+            cmd.arg(a);
+        }
+        cmd.arg("quoshtest@127.0.0.1")
             .env("QUOSH_TEST_BIN", &bin)
             .env("QUOSH_TEST_SOCK", &stack.socket)
             .env("TERM", "xterm-256color")
@@ -274,9 +280,9 @@ impl CliPty {
             match self.master.write(&bytes[off..]) {
                 Ok(0) => break,
                 Ok(n) => off += n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(
-                    Duration::from_millis(5),
-                ),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => panic!("pty write: {e}"),
             }
@@ -317,6 +323,21 @@ impl CliPty {
                 self.output()
             )
         });
+    }
+
+    /// Pump for at most `limit`; true if `needle` appeared.
+    async fn wait_for_within(&mut self, needle: &str, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            self.pump();
+            if self.output().contains(needle) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     fn icanon(&self) -> bool {
@@ -390,10 +411,7 @@ async fn cli_pty_echo_exit_restores_tty() {
         .expect("wait");
     assert_eq!(st.code(), Some(0), "expected clean remote exit, got {st:?}");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(
-        cli.icanon(),
-        "RawMode drop must restore ICANON on the PTY"
-    );
+    assert!(cli.icanon(), "RawMode drop must restore ICANON on the PTY");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -501,4 +519,91 @@ async fn cli_lossy_link_soak() {
 #[ignore = "opt-in soak; 5s smoke is cli_lossy_link_soak"]
 async fn cli_lossy_link_soak_long() {
     run_lossy_soak(60).await;
+}
+
+/// Warm the epoch with one echoed character, then slow the link and check that
+/// adaptive prediction draws the next character before its authoritative echo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_predicts_before_the_echo_arrives() {
+    let stack = Stack::start().await;
+    let mut cli = CliPty::spawn(&stack);
+    let id = wait_session(&stack, Duration::from_secs(8)).await;
+    wait_attached(&stack, id, Duration::from_secs(8)).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // A first character is tentative until the server confirms it. The PTY
+    // echo does that, which makes the epoch confident for later keystrokes.
+    cli.write(b"w");
+    cli.wait_for("w", Duration::from_secs(8)).await;
+
+    // 400 ms each way. The RTT estimate needs a ping/pong cycle to catch up.
+    stack.proxy.set_delay(Duration::from_millis(400));
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    cli.write(b"Z");
+    let predicted = cli.wait_for_within("Z", Duration::from_millis(300)).await;
+    assert!(
+        predicted,
+        "adaptive prediction must draw 'Z' well before the ~800 ms echo; output:\n{}",
+        cli.output()
+    );
+    // The authoritative echo eventually confirms it.
+    cli.wait_for("Z", Duration::from_secs(6)).await;
+    stack.proxy.set_delay(Duration::ZERO);
+}
+
+/// Control for the test above: `--predict=never` must not draw locally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_predict_never_does_not_draw_locally() {
+    let stack = Stack::start().await;
+    let mut cli = CliPty::spawn_args(&stack, &["--predict=never"]);
+    let id = wait_session(&stack, Duration::from_secs(8)).await;
+    wait_attached(&stack, id, Duration::from_secs(8)).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    stack.proxy.set_delay(Duration::from_millis(400));
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    cli.write(b"Z");
+    let early = cli.wait_for_within("Z", Duration::from_millis(300)).await;
+    assert!(
+        !early,
+        "--predict=never must wait for the remote echo; output:\n{}",
+        cli.output()
+    );
+    cli.wait_for("Z", Duration::from_secs(6)).await;
+    stack.proxy.set_delay(Duration::ZERO);
+}
+
+/// Integration check for the conservative epoch gate: after Enter the next
+/// epoch is unconfirmed, so a silent application (here `stty -echo`) must not
+/// have its keystrokes drawn at all. The oracle covers the behavioural cases;
+/// this proves the CLI actually wires `--predict=adaptive` to the predictor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_silent_input_is_not_predicted() {
+    let stack = Stack::start().await;
+    let mut cli = CliPty::spawn(&stack);
+    let id = wait_session(&stack, Duration::from_secs(8)).await;
+    wait_attached(&stack, id, Duration::from_secs(8)).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Enter starts a new, unconfirmed epoch. The remote command disables echo
+    // for a few seconds, so nothing in that epoch can be confirmed.
+    cli.write(b"stty -echo; sleep 3; stty echo\r");
+    cli.wait_for("sleep 3", Duration::from_secs(8)).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    cli.write(b"Q");
+    let drawn = cli.wait_for_within("Q", Duration::from_millis(800)).await;
+    assert!(
+        !drawn,
+        "a silent application must never have its input drawn; output:\n{}",
+        cli.output()
+    );
+
+    // Let echo come back and tear the session down.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    cli.write(b"\r");
+    cli.write(b"exit\r");
+    let _ = tokio::time::timeout(Duration::from_secs(8), cli.child.wait()).await;
 }

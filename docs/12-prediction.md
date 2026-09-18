@@ -1,8 +1,9 @@
 # Local prediction (slice 2)
 
-Status: predictor core landed (`crates/quosh-predict`) with a differential
-oracle against Mosh. The wire/protocol change and CLI wiring are specified
-below but not implemented yet. Canonical scope: [v1 spec](11-v1-spec.md).
+Status: landed. `quosh-predict` is wired through `quosh-proto` (QS2 screen
+payload with `echo_ack`), `quosh-server` (per-message write completion and
+checkpoint re-publish), and the CLI (`--predict=adaptive|never`, RTT estimate,
+timer-driven ticks). Canonical scope: [v1 spec](11-v1-spec.md).
 
 The CLI ships `--predict=adaptive|never` (default `adaptive`). `Always` exists
 only for tests and the oracle.
@@ -104,12 +105,12 @@ Three distinct states, not one:
 | **checkpoint** | a written frame is eligible for reconciliation | `echo_ack` in the screen |
 
 The owner records `(seq, completed_at)` when the last byte of a message is
-written, not when it is enqueued, and advances `echo_ack` to the newest entry
-older than 50 ms. This requires per-message boundaries in the pending-write
-buffer, which is currently flat; it becomes a queue of sequenced chunks. The
-**50 ms is a settling heuristic, not proof** that the application has read,
-processed, or echoed the input. It is a conservative lower bound on "the
-authoritative state can now be compared against this input".
+written, not when it is enqueued. The pending buffer is a queue of sequenced
+chunks (`PendingWrites`); generated replies share an unsequenced chunk so they
+never complete an input sequence. `echo_ack` advances to the newest entry older
+than 50 ms, and the owner re-publishes the current frame as a new screen
+version when it moves. The **50 ms is a settling heuristic, not proof** that
+the application has read, processed, or echoed the input.
 
 ## Safety boundaries
 
@@ -176,25 +177,27 @@ cargo test -p quosh-predict
 
 `prediction-unicode.test` (`glück faĩl`) is covered by `unicode`.
 
-## CLI wiring (next)
+## CLI wiring
 
-1. `--predict=adaptive|never`; RTT EWMA → `send_interval`.
-2. On an input read: assign one `seq`, `set_local_frame_sent(seq)`, feed each
-   byte to `new_user_byte` with the current display frame, then repaint
-   confirmed+overlay.
+1. `--predict=adaptive|never`; RTT EWMA from ping/pong → `send_interval`.
+2. On an input read: assign one `seq`, feed the bytes to `new_user_byte` with
+   the current display frame, then repaint. Because the predictor expires at
+   `local_frame_sent + 1`, message `seq` is fed as `seq - 1` so the prediction
+   expires exactly at the server's checkpoint for that message.
 3. On a screen: apply last-state-wins, set the predictor late ack from the
    screen, `cull(confirmed)`, repaint.
-4. **Timer-driven ticks.** `apply`/`cull` also have to run on a timer: a
-   prediction pending on a quiet link must still reach the 250 ms glitch
-   threshold with no incoming frames. While any prediction is active, schedule
-   the next tick at the earliest glitch/flag deadline (and a floor of ~50 ms).
-   Each tick recomputes the display from the *confirmed* frame and reapplies
-   overlays; never mutate the previous speculative frame in place.
-5. Bulk input (a read over 100 bytes, or during bracketed paste) calls
-   `reset()` and does not predict that batch. The predictor cannot see stdin
-   read sizes, so the CLI decides.
-6. Reset on transport loss, reconnect, and dimension change.
+4. Timer ticks while any prediction is active (50 ms), so a pending prediction
+   still reaches the 250 ms glitch threshold on a quiet link. Each tick
+   recomputes the display from the *confirmed* frame and reapplies overlays.
+5. Repaints are skipped when the predicted frame equals the last displayed
+   frame. This is what keeps ticks silent on a fast link, where predictions
+   are generated but `apply` leaves the frame unchanged.
+6. Bulk input (a read over 100 bytes) calls `reset()` and does not predict
+   that batch; the predictor cannot see stdin read sizes, so the CLI decides.
+7. Reset on transport loss, reconnect, and dimension change.
 
-Then a latency-injected e2e: warm confidence, prove a predicted character
-appears before the authoritative echo arrives, and prove a silent app never
-draws (fresh and post-Enter cases), with `--predict=never` as the control.
+Latency e2e (`crates/quosh-cli/tests/e2e.rs`): warm the epoch with one echoed
+character, slow the proxy to 400 ms each way, then assert the next character
+appears within 300 ms (before its ~800 ms echo); `--predict=never` asserts the
+same character does *not* appear early. A silent-app e2e runs `stty -echo` and
+asserts a post-Enter keystroke is never drawn.

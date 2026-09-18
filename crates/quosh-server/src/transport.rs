@@ -307,15 +307,7 @@ fn drain_leftover(
         let Some((typ, payload)) = split_frame(leftover)? else {
             return Ok(());
         };
-        on_control(
-            sess,
-            epoch,
-            typ,
-            &payload,
-            feed,
-            busy_input,
-            pending_resize,
-        )?;
+        on_control(sess, epoch, typ, &payload, feed, busy_input, pending_resize)?;
     }
 }
 
@@ -583,6 +575,7 @@ mod tests {
         }
         let blob = Screen {
             version: 1,
+            echo_ack: 0,
             frame: FrameState::from_parts(300, 300, 0, 0, 0, "", cells),
         }
         .encode_compressed()
@@ -641,7 +634,10 @@ mod tests {
             dt >= Duration::from_millis(300),
             "flush returned before the deadline, so writes were not blocked: {dt:?}"
         );
-        assert!(dt < Duration::from_secs(1), "flush overran its deadline: {dt:?}");
+        assert!(
+            dt < Duration::from_secs(1),
+            "flush overran its deadline: {dt:?}"
+        );
     }
 
     #[tokio::test]
