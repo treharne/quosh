@@ -275,7 +275,25 @@ enum CtrlEvent {
     Winch,
     Interrupt,
     Hangup,
+    /// The tty reader could not buffer ordinary input without dropping bytes.
+    Overflow,
     Failed(String),
+}
+
+/// Bound on consecutive transport failures while attaching. A genuine network
+/// blip should retry; a server that never completes the handshake must not spin
+/// forever.
+const MAX_HANDSHAKE_FAILURES: u32 = 5;
+
+/// Why a control-stream session ended.
+enum LinkEnd {
+    /// The server sent Exit; the shell is gone.
+    Ended,
+    /// The connection dropped after the handshake; reconnect.
+    Lost,
+    /// The handshake did not complete for a transport reason; reconnect, but
+    /// counted against [`MAX_HANDSHAKE_FAILURES`].
+    HandshakeFailed,
 }
 
 const UNACKED_CAP: usize = 256 * 1024;
@@ -327,9 +345,13 @@ fn filter_input(bytes: &[u8], escape: &mut bool) -> (Vec<u8>, bool) {
 /// Bounded local buffer for input the main loop has not consumed yet. The tty
 /// reader must never block on the ordinary input channel: during an outage the
 /// main loop stops draining it, and a blocked reader can no longer see
-/// `Ctrl-^ .`. Oldest input is dropped past the cap, matching the bounded queue
-/// the main loop already applies.
+/// `Ctrl-^ .`. Past the cap we fail closed (see [`TtyWriter::send`]) rather than
+/// drop bytes and keep forwarding a command stream with holes in it.
 const TTY_PENDING_CAP: usize = 64 * 1024;
+
+/// While input is buffered locally, wake up this often to retry handing it to
+/// the main loop; there is no capacity notification on a synchronous `try_send`.
+const TTY_FLUSH_POLL_MS: libc::c_int = 20;
 
 struct TtyWriter {
     bytes: mpsc::Sender<Vec<u8>>,
@@ -348,6 +370,10 @@ impl TtyWriter {
         }
     }
 
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// Quit is control, not ordinary input: put it on the control channel and
     /// try the preceding bytes best-effort, so a full input queue cannot
     /// strand it.
@@ -358,21 +384,22 @@ impl TtyWriter {
         }
     }
 
-    /// Hand ordinary input to the main loop without ever blocking. The reader
-    /// keeps running (and stays able to see a later quit) even when the main
-    /// loop has stopped consuming.
-    fn send(&mut self, out: Vec<u8>) {
-        if !out.is_empty() {
-            self.pending_bytes += out.len();
-            self.pending.push_back(out);
-            while self.pending_bytes > TTY_PENDING_CAP {
-                match self.pending.pop_front() {
-                    Some(dropped) => self.pending_bytes -= dropped.len(),
-                    None => break,
-                }
-            }
-        }
+    /// Hand ordinary input to the main loop without ever blocking. Returns
+    /// `false` when the local buffer is full: the stream would have to be
+    /// truncated to keep reading, so the caller fails closed instead. The
+    /// reader stays responsive to a later quit either way.
+    fn send(&mut self, out: Vec<u8>) -> bool {
         self.flush();
+        if out.is_empty() {
+            return true;
+        }
+        if self.pending_bytes + out.len() > TTY_PENDING_CAP {
+            return false;
+        }
+        self.pending_bytes += out.len();
+        self.pending.push_back(out);
+        self.flush();
+        true
     }
 
     fn flush(&mut self) {
@@ -409,7 +436,15 @@ fn spawn_tty_reader(bytes: mpsc::Sender<Vec<u8>>, ctrl: mpsc::Sender<CtrlEvent>,
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                let pr = unsafe { libc::poll(&mut pfd, 1, -1) };
+                // If input is buffered locally, poll with a deadline so we
+                // retry handing it over once the main loop starts consuming
+                // again. Otherwise wait indefinitely for the next keystroke.
+                let timeout = if writer.has_pending() {
+                    TTY_FLUSH_POLL_MS
+                } else {
+                    -1
+                };
+                let pr = unsafe { libc::poll(&mut pfd, 1, timeout) };
                 if pr < 0 {
                     let e = io::Error::last_os_error();
                     if e.kind() == io::ErrorKind::Interrupted {
@@ -417,6 +452,12 @@ fn spawn_tty_reader(bytes: mpsc::Sender<Vec<u8>>, ctrl: mpsc::Sender<CtrlEvent>,
                     }
                     let _ = err_ctrl.blocking_send(CtrlEvent::Failed(format!("tty poll: {e}")));
                     break;
+                }
+                // Retry any locally buffered input on every wake, including the
+                // timeout above.
+                writer.flush();
+                if pr == 0 {
+                    continue;
                 }
                 if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
                     let _ = err_ctrl.blocking_send(CtrlEvent::Eof);
@@ -443,7 +484,14 @@ fn spawn_tty_reader(bytes: mpsc::Sender<Vec<u8>>, ctrl: mpsc::Sender<CtrlEvent>,
                     writer.quit(out);
                     break;
                 }
-                writer.send(out);
+                if !writer.send(out) {
+                    // Fail closed: forwarding the buffered prefix and then
+                    // dropping bytes would corrupt the command stream. The main
+                    // loop tears the attachment down instead; the remote
+                    // session survives for a reattach.
+                    let _ = err_ctrl.blocking_send(CtrlEvent::Overflow);
+                    break;
+                }
             }
         })
         .expect("spawn tty thread");
@@ -515,8 +563,16 @@ fn handshake_closed() -> anyhow::Error {
     handshake_failed("connection closed before HelloOk")
 }
 
-/// Explicitly fatal: retrying cannot fix a server that will not complete the
-/// handshake with a valid `HelloOk`.
+/// Fail closed rather than forward a command stream with bytes missing.
+fn input_overflowed() -> anyhow::Error {
+    fatal(
+        "local input buffer overflowed while the connection was stalled; \
+         refusing to forward a partial command stream (reconnect and retry)",
+    )
+}
+
+/// A handshake that never completes. Used only after transport failures repeat,
+/// so a transient network interruption during attach is retried first.
 fn handshake_failed(reason: impl std::fmt::Display) -> anyhow::Error {
     fatal(format!(
         "handshake with quosh-server failed: {reason} \
@@ -705,6 +761,7 @@ async fn run_session(
     }
 
     let mut connect_fut = start_connect(url.clone(), hash, false);
+    let mut handshake_failures = 0u32;
     let result: Result<()> = loop {
         if hungup {
             break Ok(());
@@ -740,11 +797,22 @@ async fn run_session(
                         )
                         .await
                         {
-                            Ok(true) => break Ok(()),
-                            Ok(false) => {}
+                            Ok(LinkEnd::Ended) => break Ok(()),
+                            Ok(LinkEnd::Lost) => {
+                                handshake_failures = 0;
+                            }
+                            Ok(LinkEnd::HandshakeFailed) => {
+                                handshake_failures += 1;
+                                if handshake_failures >= MAX_HANDSHAKE_FAILURES {
+                                    break Err(handshake_failed(format!(
+                                        "gave up after {handshake_failures} transport \
+                                         failures during attach"
+                                    )));
+                                }
+                            }
                             Err(e) if e.downcast_ref::<FatalServer>().is_some() => {
-                                // Unknown session, bad token, or protocol
-                                // mismatch: reconnecting cannot help.
+                                // Protocol/authentication rejection, or local
+                                // input overflow: reconnecting cannot help.
                                 break Err(e);
                             }
                             Err(e) => {
@@ -774,6 +842,7 @@ async fn run_session(
                     Some(CtrlEvent::Interrupt) | Some(CtrlEvent::Hangup) => {
                         hungup = true;
                     }
+                    Some(CtrlEvent::Overflow) => break Err(input_overflowed()),
                     Some(CtrlEvent::Eof) if raw.is_some() => {
                         hungup = true;
                     }
@@ -881,7 +950,7 @@ async fn session_loop(
     token: [u8; 32],
     live: &mut Live<'_>,
     render: &mut Render,
-) -> Result<bool> {
+) -> Result<LinkEnd> {
     let cols = &mut *live.cols;
     let rows = &mut *live.rows;
     let seq = &mut *live.seq;
@@ -962,7 +1031,7 @@ async fn session_loop(
                         decode_exit(&payload).map_err(|e| fatal(format!("protocol error: {e}")))?;
                     *exit_code = st;
                     *hungup = true;
-                    return Ok(true);
+                    return Ok(LinkEnd::Ended);
                 }
                 MSG_ERROR => {
                     let (c, m) = decode_error(&payload)
@@ -989,13 +1058,19 @@ async fn session_loop(
                     // Clean EOF (None or zero-length) before the handshake is
                     // a rejection; after it, a transport loss to retry.
                     Ok(_) => {
-                        return if hello_ok { Ok(false) } else { Err(handshake_closed()) };
-                    }
-                    Err(e) => {
                         return if hello_ok {
-                            Ok(false)
+                            Ok(LinkEnd::Lost)
                         } else {
-                            Err(handshake_failed(format!("transport error: {e}")))
+                            Err(handshake_closed())
+                        };
+                    }
+                    // A read error is a transient transport failure even
+                    // mid-attach; retry it (bounded by the caller).
+                    Err(_) => {
+                        return if hello_ok {
+                            Ok(LinkEnd::Lost)
+                        } else {
+                            Ok(LinkEnd::HandshakeFailed)
                         };
                     }
                 }
@@ -1011,14 +1086,36 @@ async fn session_loop(
                             apply_modes(mode, &mut last_mode);
                         }
                     }
-                    Err(_) => return if hello_ok { Ok(false) } else { Err(handshake_closed()) },
+                    // A datagram error is a transient transport failure.
+                    Err(_) => {
+                        return if hello_ok {
+                            Ok(LinkEnd::Lost)
+                        } else {
+                            Ok(LinkEnd::HandshakeFailed)
+                        };
+                    }
                 }
             }
             n = send.write(feed.rest()), if feed.writing() => {
                 match n {
-                    Ok(0) => return if hello_ok { Ok(false) } else { Err(handshake_closed()) },
+                    // A clean close before `HelloOk` is a rejection; after it,
+                    // a transport loss to retry.
+                    Ok(0) => {
+                        return if hello_ok {
+                            Ok(LinkEnd::Lost)
+                        } else {
+                            Err(handshake_closed())
+                        };
+                    }
                     Ok(n) => feed.advance(n),
-                    Err(_) => return if hello_ok { Ok(false) } else { Err(handshake_closed()) },
+                    // A write error is a transient transport failure.
+                    Err(_) => {
+                        return if hello_ok {
+                            Ok(LinkEnd::Lost)
+                        } else {
+                            Ok(LinkEnd::HandshakeFailed)
+                        };
+                    }
                 }
             }
             ev = ctrl_rx.recv() => {
@@ -1027,11 +1124,12 @@ async fn session_loop(
                         feed.push_fin(encode_hangup());
                         *hungup = true;
                         flush_bounded(&mut send, &mut feed, Duration::from_millis(400)).await;
-                        return Ok(true);
+                        return Ok(LinkEnd::Ended);
                     }
                     Some(CtrlEvent::Failed(m)) => {
                         bail!("input: {m}");
                     }
+                    Some(CtrlEvent::Overflow) => return Err(input_overflowed()),
                     Some(CtrlEvent::Winch) => {
                         let (c, r) = tty_size();
                         *cols = c;
@@ -1219,7 +1317,7 @@ mod tests {
 
         let mut writer = TtyWriter::new(btx, ctx);
         // Ordinary input backs up locally instead of blocking the reader.
-        writer.send(vec![b'a']);
+        assert!(writer.send(vec![b'a']));
 
         // Ctrl-^ . arrives: the quit event must get through regardless.
         writer.quit(vec![b'z']);
@@ -1229,6 +1327,48 @@ mod tests {
         assert!(matches!(brx.try_recv(), Ok(v) if v == vec![b'x']));
         writer.flush();
         assert!(matches!(brx.try_recv(), Ok(v) if v == vec![b'a']));
+    }
+
+    #[test]
+    fn reader_flushes_buffered_input_when_the_channel_drains() {
+        // The actual reader, with a pipe standing in for the tty. The bug this
+        // guards: after buffering, the reader returned to an indefinite poll
+        // and did not flush until another keystroke arrived.
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read_end = unsafe { File::from_raw_fd(fds[0]) };
+        let write_end = unsafe { File::from_raw_fd(fds[1]) };
+
+        let (btx, mut brx) = mpsc::channel::<Vec<u8>>(1);
+        let (ctx, _crx) = mpsc::channel::<CtrlEvent>(4);
+        btx.try_send(vec![b'x']).expect("fill input channel");
+        spawn_tty_reader(btx, ctx, read_end);
+
+        // One keystroke while the channel is full: buffered, not delivered.
+        let mut w = &write_end;
+        w.write_all(b"a").expect("write to pipe");
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(matches!(brx.try_recv(), Ok(v) if v == vec![b'x']));
+
+        // Drain: the reader must flush 'a' on its own, with no further input.
+        assert_eq!(brx.blocking_recv(), Some(vec![b'a']));
+    }
+
+    #[test]
+    fn input_overflow_fails_closed_instead_of_dropping_bytes() {
+        // The channel stays full, so the local buffer is the only place input
+        // can go. Past the cap the writer must refuse rather than discard
+        // bytes and keep forwarding a truncated stream.
+        let (btx, _brx) = mpsc::channel::<Vec<u8>>(1);
+        let (ctx, _crx) = mpsc::channel::<CtrlEvent>(4);
+        btx.try_send(vec![b'x']).expect("fill input channel");
+        let mut writer = TtyWriter::new(btx, ctx);
+
+        let chunk = vec![b'a'; 4096];
+        while writer.pending_bytes + chunk.len() <= TTY_PENDING_CAP {
+            assert!(writer.send(chunk.clone()));
+        }
+        assert!(!writer.send(chunk), "overflow must be reported, not dropped");
     }
 
     #[test]
