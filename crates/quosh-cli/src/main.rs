@@ -9,6 +9,7 @@ use quosh_proto::{
     decode_exit, decode_u64, encode_ack_state, encode_hangup, encode_input, encode_ping,
     encode_resize, frame_ansi, parse_connect_line, split_frame,
 };
+use std::collections::VecDeque;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, IsTerminal, Write};
@@ -323,6 +324,76 @@ fn filter_input(bytes: &[u8], escape: &mut bool) -> (Vec<u8>, bool) {
     (out, quit)
 }
 
+/// Bounded local buffer for input the main loop has not consumed yet. The tty
+/// reader must never block on the ordinary input channel: during an outage the
+/// main loop stops draining it, and a blocked reader can no longer see
+/// `Ctrl-^ .`. Oldest input is dropped past the cap, matching the bounded queue
+/// the main loop already applies.
+const TTY_PENDING_CAP: usize = 64 * 1024;
+
+struct TtyWriter {
+    bytes: mpsc::Sender<Vec<u8>>,
+    ctrl: mpsc::Sender<CtrlEvent>,
+    pending: VecDeque<Vec<u8>>,
+    pending_bytes: usize,
+}
+
+impl TtyWriter {
+    fn new(bytes: mpsc::Sender<Vec<u8>>, ctrl: mpsc::Sender<CtrlEvent>) -> Self {
+        Self {
+            bytes,
+            ctrl,
+            pending: VecDeque::new(),
+            pending_bytes: 0,
+        }
+    }
+
+    /// Quit is control, not ordinary input: put it on the control channel and
+    /// try the preceding bytes best-effort, so a full input queue cannot
+    /// strand it.
+    fn quit(&mut self, out: Vec<u8>) {
+        let _ = self.ctrl.blocking_send(CtrlEvent::Hangup);
+        if !out.is_empty() {
+            let _ = self.bytes.try_send(out);
+        }
+    }
+
+    /// Hand ordinary input to the main loop without ever blocking. The reader
+    /// keeps running (and stays able to see a later quit) even when the main
+    /// loop has stopped consuming.
+    fn send(&mut self, out: Vec<u8>) {
+        if !out.is_empty() {
+            self.pending_bytes += out.len();
+            self.pending.push_back(out);
+            while self.pending_bytes > TTY_PENDING_CAP {
+                match self.pending.pop_front() {
+                    Some(dropped) => self.pending_bytes -= dropped.len(),
+                    None => break,
+                }
+            }
+        }
+        self.flush();
+    }
+
+    fn flush(&mut self) {
+        while let Some(front) = self.pending.pop_front() {
+            let n = front.len();
+            match self.bytes.try_send(front) {
+                Ok(()) => self.pending_bytes -= n,
+                Err(mpsc::error::TrySendError::Full(front)) => {
+                    self.pending.push_front(front);
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.pending.clear();
+                    self.pending_bytes = 0;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn spawn_tty_reader(bytes: mpsc::Sender<Vec<u8>>, ctrl: mpsc::Sender<CtrlEvent>, tty: File) {
     std::thread::Builder::new()
         .name("quosh-tty".into())
@@ -330,6 +401,8 @@ fn spawn_tty_reader(bytes: mpsc::Sender<Vec<u8>>, ctrl: mpsc::Sender<CtrlEvent>,
             let fd = tty.as_raw_fd();
             let mut buf = [0u8; 4096];
             let mut escape = false;
+            let err_ctrl = ctrl.clone();
+            let mut writer = TtyWriter::new(bytes, ctrl);
             loop {
                 let mut pfd = libc::pollfd {
                     fd,
@@ -342,11 +415,11 @@ fn spawn_tty_reader(bytes: mpsc::Sender<Vec<u8>>, ctrl: mpsc::Sender<CtrlEvent>,
                     if e.kind() == io::ErrorKind::Interrupted {
                         continue;
                     }
-                    let _ = ctrl.blocking_send(CtrlEvent::Failed(format!("tty poll: {e}")));
+                    let _ = err_ctrl.blocking_send(CtrlEvent::Failed(format!("tty poll: {e}")));
                     break;
                 }
                 if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                    let _ = ctrl.blocking_send(CtrlEvent::Eof);
+                    let _ = err_ctrl.blocking_send(CtrlEvent::Eof);
                     break;
                 }
                 if pfd.revents & libc::POLLIN == 0 {
@@ -358,21 +431,19 @@ fn spawn_tty_reader(bytes: mpsc::Sender<Vec<u8>>, ctrl: mpsc::Sender<CtrlEvent>,
                     if e.kind() == io::ErrorKind::Interrupted {
                         continue;
                     }
-                    let _ = ctrl.blocking_send(CtrlEvent::Failed(format!("tty read: {e}")));
+                    let _ = err_ctrl.blocking_send(CtrlEvent::Failed(format!("tty read: {e}")));
                     break;
                 }
                 if n == 0 {
-                    let _ = ctrl.blocking_send(CtrlEvent::Eof);
+                    let _ = err_ctrl.blocking_send(CtrlEvent::Eof);
                     break;
                 }
                 let (out, quit) = filter_input(&buf[..n as usize], &mut escape);
-                if !out.is_empty() && bytes.blocking_send(out).is_err() {
-                    break;
-                }
                 if quit {
-                    let _ = ctrl.blocking_send(CtrlEvent::Hangup);
+                    writer.quit(out);
                     break;
                 }
+                writer.send(out);
             }
         })
         .expect("spawn tty thread");
@@ -441,10 +512,16 @@ fn fatal(msg: impl Into<String>) -> anyhow::Error {
 /// A control stream that closes before `HelloOk` is a server-side rejection,
 /// not a network drop we should retry.
 fn handshake_closed() -> anyhow::Error {
-    fatal(
-        "server closed the connection during the handshake \
-         (is quosh-server up to date with this client?)",
-    )
+    handshake_failed("connection closed before HelloOk")
+}
+
+/// Explicitly fatal: retrying cannot fix a server that will not complete the
+/// handshake with a valid `HelloOk`.
+fn handshake_failed(reason: impl std::fmt::Display) -> anyhow::Error {
+    fatal(format!(
+        "handshake with quosh-server failed: {reason} \
+         (is quosh-server up to date with this client?)"
+    ))
 }
 
 /// Owns the confirmed screen, the predictor, and the last displayed frame.
@@ -839,10 +916,15 @@ async fn session_loop(
     let mut hello_ok = false;
 
     loop {
-        while let Some((typ, payload)) = split_frame(&mut buf)? {
+        // Every frame parse failure is a protocol violation, not a transient
+        // network problem: retrying the same pair cannot help.
+        while let Some((typ, payload)) =
+            split_frame(&mut buf).map_err(|e| fatal(format!("protocol error: {e}")))?
+        {
             match typ {
                 MSG_HELLO_OK => {
-                    let hello = HelloOk::decode(&payload)?;
+                    let hello = HelloOk::decode(&payload)
+                        .map_err(|e| handshake_failed(format!("invalid HelloOk: {e}")))?;
                     if hello.protocol != PROTOCOL_VERSION {
                         return Err(fatal(format!(
                             "server protocol {} != client {PROTOCOL_VERSION}; update the other side",
@@ -861,7 +943,8 @@ async fn session_loop(
                     }
                 }
                 MSG_INPUT_ACK => {
-                    let ack = decode_u64(&payload)?;
+                    let ack =
+                        decode_u64(&payload).map_err(|e| fatal(format!("protocol error: {e}")))?;
                     unacked.retain(|(s, _)| *s > ack);
                 }
                 MSG_PONG => {
@@ -875,13 +958,15 @@ async fn session_loop(
                     render.clear_outage()?;
                 }
                 MSG_EXIT => {
-                    let st = decode_exit(&payload)?;
+                    let st =
+                        decode_exit(&payload).map_err(|e| fatal(format!("protocol error: {e}")))?;
                     *exit_code = st;
                     *hungup = true;
                     return Ok(true);
                 }
                 MSG_ERROR => {
-                    let (c, m) = decode_error(&payload)?;
+                    let (c, m) = decode_error(&payload)
+                        .map_err(|e| fatal(format!("protocol error: {e}")))?;
                     return Err(fatal(format!("server error {c}: {m}")));
                 }
                 _ => {}
@@ -896,12 +981,24 @@ async fn session_loop(
         let tick = render.tick_delay();
         tokio::select! {
             n = recv.read(&mut tmp_recv) => {
-                let n = n?.unwrap_or(0);
-                if n == 0 {
-                    return if hello_ok { Ok(false) } else { Err(handshake_closed()) };
+                match n {
+                    Ok(Some(n)) if n > 0 => {
+                        *last_ok = Instant::now();
+                        buf.extend_from_slice(&tmp_recv[..n]);
+                    }
+                    // Clean EOF (None or zero-length) before the handshake is
+                    // a rejection; after it, a transport loss to retry.
+                    Ok(_) => {
+                        return if hello_ok { Ok(false) } else { Err(handshake_closed()) };
+                    }
+                    Err(e) => {
+                        return if hello_ok {
+                            Ok(false)
+                        } else {
+                            Err(handshake_failed(format!("transport error: {e}")))
+                        };
+                    }
                 }
-                *last_ok = Instant::now();
-                buf.extend_from_slice(&tmp_recv[..n]);
             }
             dg = conn.read_datagram() => {
                 match dg {
@@ -1111,6 +1208,28 @@ impl Drop for RawMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quit_is_delivered_when_the_input_channel_is_full() {
+        // Reproduces the stranding: the main loop stops draining `bytes`
+        // during an outage, so the reader must not block on it.
+        let (btx, mut brx) = mpsc::channel::<Vec<u8>>(1);
+        let (ctx, mut crx) = mpsc::channel::<CtrlEvent>(4);
+        btx.try_send(vec![b'x']).expect("fill input channel");
+
+        let mut writer = TtyWriter::new(btx, ctx);
+        // Ordinary input backs up locally instead of blocking the reader.
+        writer.send(vec![b'a']);
+
+        // Ctrl-^ . arrives: the quit event must get through regardless.
+        writer.quit(vec![b'z']);
+        assert!(matches!(crx.try_recv(), Ok(CtrlEvent::Hangup)));
+
+        // Once the consumer drains, the buffered 'a' is delivered.
+        assert!(matches!(brx.try_recv(), Ok(v) if v == vec![b'x']));
+        writer.flush();
+        assert!(matches!(brx.try_recv(), Ok(v) if v == vec![b'a']));
+    }
 
     #[test]
     fn quit_sequence_is_consumed_and_other_keys_forwarded() {

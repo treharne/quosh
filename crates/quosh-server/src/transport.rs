@@ -20,6 +20,21 @@ pub(crate) const BUSY_CAP: usize = 256 * 1024;
 /// or tiny records cannot accumulate without bound.
 const INPUT_RECORD_OVERHEAD: usize = 32;
 
+/// Wait briefly for the peer to acknowledge the final stream data before the
+/// connection is dropped. Dropping first can discard unacknowledged frames
+/// (Exit or a rejection `Error`), leaving the client with a bare
+/// ApplicationClosed. Bounded because a blackholed/replaced peer never acks.
+async fn finish_send(send: &mut wtransport::SendStream) {
+    let _ = tokio::time::timeout(Duration::from_millis(150), send.finish()).await;
+}
+
+/// Send a terminal error and close the stream so the client sees it.
+async fn reject(send: &mut wtransport::SendStream, code: u16, msg: &str) -> anyhow::Error {
+    let _ = send.write_all(&encode_error(code, msg)).await;
+    finish_send(send).await;
+    anyhow::anyhow!("{msg}")
+}
+
 pub async fn handle_incoming(incoming: IncomingSession, sessions: Registry) -> Result<()> {
     let req = incoming.await.context("incoming WT")?;
     let path = req.path().to_string();
@@ -37,31 +52,27 @@ pub async fn handle_incoming(incoming: IncomingSession, sessions: Registry) -> R
         buf.extend_from_slice(&tmp[..n]);
         if let Some((typ, payload)) = split_frame(&mut buf)? {
             if typ != MSG_HELLO {
-                send.write_all(&encode_error(1, "expected hello")).await?;
-                bail!("expected hello got {typ}");
+                return Err(reject(&mut send, 1, "expected hello").await);
             }
             match Hello::decode(&payload) {
                 Ok(hello) if hello.protocol == PROTOCOL_VERSION => break hello,
                 Ok(hello) => {
-                    let _ = send
-                        .write_all(&encode_error(
-                            4,
-                            "protocol version mismatch; update quosh-server",
-                        ))
-                        .await;
-                    bail!("protocol version {} != {PROTOCOL_VERSION}", hello.protocol);
+                    let msg = format!(
+                        "protocol version {} != {PROTOCOL_VERSION}; update quosh-server",
+                        hello.protocol
+                    );
+                    return Err(reject(&mut send, 4, &msg).await);
                 }
-                Err(e) => {
+                Err(_) => {
                     // A client speaking an older layout: try to say so before
                     // dropping, since it will otherwise just see a closed
                     // stream.
-                    let _ = send
-                        .write_all(&encode_error(
-                            4,
-                            "protocol version mismatch; update quosh-server",
-                        ))
-                        .await;
-                    bail!("undecodable hello: {e}");
+                    return Err(reject(
+                        &mut send,
+                        4,
+                        "protocol version mismatch; update quosh-server",
+                    )
+                    .await);
                 }
             }
         }
@@ -72,12 +83,10 @@ pub async fn handle_incoming(incoming: IncomingSession, sessions: Registry) -> R
         g.get(&hello.session_id).cloned()
     };
     let Some(sess) = sess else {
-        send.write_all(&encode_error(2, "unknown session")).await?;
-        bail!("unknown session");
+        return Err(reject(&mut send, 2, "unknown session").await);
     };
     if sess.token != hello.token {
-        send.write_all(&encode_error(3, "bad token")).await?;
-        bail!("bad token");
+        return Err(reject(&mut send, 3, "bad token").await);
     }
 
     let pending_hello_size = if hello.cols > 0 && hello.rows > 0 {
@@ -257,7 +266,7 @@ async fn run_transport(
     // race the final Exit frame (intermittent ApplicationClosed on the client).
     // Wait briefly for the peer to ack, bounded because a blackholed or
     // replaced peer never will.
-    let _ = tokio::time::timeout(Duration::from_millis(150), send.finish()).await;
+    finish_send(send).await;
     Ok(())
 }
 

@@ -196,6 +196,15 @@ cargo test -p quosh-predict
 6. Bulk input (a read over 100 bytes) calls `reset()` and does not predict
    that batch; the predictor cannot see stdin read sizes, so the CLI decides.
 7. Reset on transport loss, reconnect, and dimension change.
+8. The tty reader never blocks on the ordinary input channel. It buffers a
+   bounded 64 KiB locally (dropping oldest) so a full input queue cannot stop
+   it reading; `Ctrl-^ .` is delivered on the control channel first.
+9. Failure classification is explicit. Before `HelloOk`, any failure — closed
+   stream, read error, malformed `HelloOk`, wrong protocol, or a server error —
+   is fatal, because retrying the same pair cannot help. After `HelloOk`, a
+   read/write/datagram error is a transient transport loss and reconnects.
+   Every terminal frame (Exit or a rejection Error) is followed by a bounded
+   `send.finish()` so the connection is not dropped before the peer acks it.
 
 Latency e2e (`crates/quosh-cli/tests/e2e.rs`): warm the epoch with one echoed
 character, slow the proxy to 400 ms each way, then assert the next character
