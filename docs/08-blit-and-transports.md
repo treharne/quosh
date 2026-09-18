@@ -1,5 +1,9 @@
 # Blit reuse, transport choices, and alternatives
 
+Grill update: unmodified crates only; last-state-wins instead of Blit ordered diffs; one WebTransport endpoint on UDP 443. See [11-v1-spec.md](11-v1-spec.md).
+
+# Blit reuse, transport choices, and alternatives (original)
+
 Research date: 2026-09-17. Prepared for Quosh's agreed first version: a small CLI/browser shell demo; sessions survive disconnections but not server restarts; one-time SSH-assisted passkey enrolment; Mosh-style outage banner with continued input queueing.
 
 ## Follow-up clarification

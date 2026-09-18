@@ -1,5 +1,7 @@
 # Candidate libraries and projects
 
+Historical backlog. Current choices: [11-v1-spec.md](11-v1-spec.md).
+
 This preserves the initial evaluation backlog. The [2026-09-17 source review](08-blit-and-transports.md) supersedes its unverified assumptions: Blit is the recommended reuse starting point, with remaining input-recovery, shared-prediction, and passkey work. Current Blit includes browser speculative echo and a native terminal attach client, but its terminal transports are reliable/ordered. No packages have been installed into Quosh; no integration has been built.
 
 | Candidate | Proposed role | Questions to verify |

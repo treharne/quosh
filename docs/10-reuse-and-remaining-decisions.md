@@ -1,6 +1,6 @@
 # Current reuse boundary and remaining decisions
 
-Updated 2026-09-17. This is the current design direction; earlier research alternatives remain historical. No implementation has been authorised.
+Updated 2026-09-17 after the grill. Historical research; **current** boundary is [11-v1-spec.md](11-v1-spec.md). Implementation is authorised.
 
 ## Intended component boundary
 
@@ -10,7 +10,7 @@ Updated 2026-09-17. This is the current design direction; earlier research alter
 | Confirmed screen state | Reuse Blit's screen representation and applicable snapshot/diff encoding primitives. Add metadata where Quosh needs it. |
 | Browser display | Reuse Blit's WASM/WebGL renderer; adapt its frontend/state integration. Do not add xterm.js by default. |
 | PTY/process and CLI mechanics | Reuse separable Blit or existing library code; adapt lifecycle and native display plumbing. Exact dependency/fork/extraction boundary needs validation. |
-| Screen synchronization | Build Quosh's versioned baseline, replaceable update, acknowledgement and snapshot-recovery semantics. Blit's ordered diff protocol is not sufficient unchanged. |
+| Screen synchronization | Quosh last-state-wins versioned payloads. Do not use Blit `feed_compressed` as the sync engine. |
 | Network adapter | Compose an existing QUIC/WebTransport implementation with Quosh's reliable-stream/datagram policy. Reuse useful connection code where appropriate; no new QUIC or TLS implementation. |
 | Input recovery | Build bounded client queues, session-scoped input identities, acknowledgements, replay suppression at the PTY owner, reconnect handling, and outage display. |
 | Prediction | Build shared transport-independent prediction/reconciliation against confirmed state. Treat Blit's browser echo as a reference, not the final shared predictor. |
@@ -26,8 +26,8 @@ No WebSocket or fallback. Use QUIC/WebTransport; keep reliable streams for input
 
 - The browser client is a separately hosted static HTTPS PWA. Quosh has no project-operated application backend, account server, discovery service, or terminal relay. The browser connects directly to the user's own Quosh server; that server owns sessions, authentication verification, and durable enrolment state. Static website hosting serves application assets only.
 - The PWA host's HTTPS certificate protects delivery of the application. The user's server has its own QUIC/TLS identity, generated and managed automatically; no user-provisioned domain/public certificate is required by the intended design. Static hosting alone does not solve server certificate trust or renewal.
-- One inbound UDP listening port on the user's server is acceptable. Use WebTransport over HTTP/3 over QUIC; the configured port need not be 443. No WS fallback or central relay. Initial SSH-assisted enrolment uses the user's existing SSH access separately.
-- One active controller per shell, with explicit takeover. The current controller owns input and terminal size; stale controller input must not be accepted after takeover. Confirmed: invalidate the replaced controller's remaining queued input, and notify it on reconnect. Already accepted input cannot be undone; define a server-enforced handoff boundary.
+- One inbound UDP port: **443**. WebTransport only. No WS, no relay.
+- No takeover. New process = new shell. Same-token reconnect replaces transport.
 - Initial required platforms: Ubuntu server, macOS CLI, Chrome browser. Aim for PWA use on iOS and Android, and design platform boundaries for eventual broad modern server/OS/browser support. This is a portability goal, not a claim that all browser capabilities work everywhere today.
 - Project license: GNU GPLv3. Record this selection in design documentation; exact notices and dependency obligations will be handled before source distribution. Do not silently substitute a different license or version option.
 
@@ -39,4 +39,4 @@ Use normal passkey behavior, including a password manager's synced credentials w
 
 Specify input acknowledgement semantics, delta baseline/version rules, resize ordering, bounded buffers and expiry policies, conservative prediction rules, authenticated certificate rotation after long-offline periods, passkey origin verification, and measurement thresholds. Propose concrete designs and validate them after implementation is authorised; ask Jesse only when a choice changes product behavior or operational requirements.
 
-The main product questions are settled. Next produce a concrete bootstrap/trust-refresh and controller-handoff proposal under the static-PWA/direct-user-server constraint. No additional central service may be assumed. No implementation is authorised by this design discussion.
+Product questions are settled in [11-v1-spec.md](11-v1-spec.md).

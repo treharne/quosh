@@ -1,5 +1,7 @@
 # Mosh source reference
 
+Local checkout: `reference/mosh` (gitignored). v1 behavior we copied is in [11-v1-spec.md](11-v1-spec.md).
+
 Fetched on 2026-09-17 at Jesse's request. This is a reference checkout only; no build was run and no Mosh code was copied into Quosh.
 
 - Official repository: https://github.com/mobile-shell/mosh

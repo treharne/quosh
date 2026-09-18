@@ -1,6 +1,6 @@
 # Protocol and prediction concepts
 
-All message names and delivery choices below are illustrative design proposals, not a wire specification.
+Slice 1 wire format is specified in [11-v1-spec.md](11-v1-spec.md). This note keeps the rationale.
 
 ## State and identity
 
@@ -19,9 +19,9 @@ Candidate message families: negotiate capabilities; create/attach/detach; input;
 | Authentication, attachment, capabilities, lifecycle | Reliable stream |
 | Ordered input and resize/control | Reliable stream with application sequencing across reconnects |
 | Snapshots and resynchronisation | Reliable transfer with atomic installation |
-| Replaceable visual updates | Explore datagrams once recovery and dependency rules are established |
+| Replaceable visual updates | Versioned datagrams; stale versions dropped. Full `FrameState` is allowed. Uni-stream resync if the datagram cannot carry the payload. |
 
-Do not assume a chain of incremental deltas survives datagram loss. A delta whose base is missing must not be applied. Possible strategies include diffing against a client-confirmed baseline, self-contained replaceable updates, or requesting a fresh snapshot. Compare them before selecting one.
+Last-state-wins: a missed datagram is ignored. The next payload is a complete newer version (or a later diff against an acked base). Do not apply Blit ordered ops against a client grid that may have missed a packet.
 
 Drop stale visual updates only when their state is superseded and no required dependency or nonvisual effect is lost. A screen snapshot does not automatically capture every terminal event: bells, clipboard requests, and other side effects need explicit handling and policy.
 
@@ -46,7 +46,7 @@ The protocol must prevent duplicate execution when a disconnect occurs after inp
 
 ## Controller takeover
 
-Confirmed: takeover invalidates the previous controller's remaining queued input. Bind input to a server-enforced controller generation and reject stale-generation submissions, including after reconnect. Notify the replaced client that its queue has been invalidated. Define the acceptance/handoff ordering so input already written before takeover is not falsely described as cancelled; unresolved acknowledgements need reconciliation against that boundary.
+Withdrawn. v1 has no takeover and no viewers. A second client process creates a new session. Same-token reconnect replaces the WebTransport for that session only.
 
 ## Resize and compatibility
 

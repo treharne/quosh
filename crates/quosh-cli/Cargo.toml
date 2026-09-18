@@ -1,0 +1,28 @@
+[package]
+name = "quosh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "quosh"
+path = "src/main.rs"
+
+[dependencies]
+quosh-proto.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+hex.workspace = true
+blit-remote.workspace = true
+libc = "0.2"
+nix = { version = "0.30", features = ["term", "fs"] }
+url = "2"
+web-transport-quinn = { version = "0.12", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+[dev-dependencies]
+quosh-server = { path = "../quosh-server" }
+wtransport = "0.6"
+rand.workspace = true

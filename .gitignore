@@ -1,0 +1,8 @@
+# Local study checkouts. Not part of the Quosh build.
+/reference/
+
+/target/
+**/*.rs.bk
+
+# Generated test credentials. Never commit.
+/.test-keys/

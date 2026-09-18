@@ -1,0 +1,30 @@
+[package]
+name = "quosh-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+quosh-proto.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+hex.workspace = true
+rand.workspace = true
+blit-remote.workspace = true
+alacritty_terminal = { package = "blit-alacritty-terminal", version = "=0.26.0-blit.1" }
+nix = { version = "0.30", features = ["term", "user", "fs", "process", "socket", "hostname", "signal"] }
+libc = "0.2"
+wtransport = "0.6"
+rcgen = { version = "0.13", features = ["pem"] }
+sha2 = "0.10"
+time = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+
+[dev-dependencies]
+web-transport-quinn = { version = "0.12", default-features = false, features = ["ring"] }
+url = "2"

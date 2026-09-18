@@ -2,33 +2,39 @@
 
 **Quosh = “Mosh using QUIC”.**
 
-Status: design notes only. No implementation has started. Wait for Jesse to explicitly say to start implementation before creating code, a Cargo workspace, dependencies, or prototypes.
+Reconnectable remote shells over WebTransport, with Mosh-style prediction as a later slice. Not a Herdr clone.
 
-Quosh explores responsive, reconnectable remote terminals with a shared core for an ssh-like CLI, a browser terminal, and a mobile app. Its central idea is that communications and Mosh-style client prediction are orthogonal; terminal-state synchronisation is a separate concern between them.
+License: [GNU GPLv3](LICENSE).
+
+## Status
+
+Implementation is underway. Slice 1 is the CLI session path (root daemon, `quosh user@host`, login shell, reconnect, hangup). Prediction and the PWA are not in this slice.
+
+Canonical spec: [docs/11-v1-spec.md](docs/11-v1-spec.md).
 
 ## Reading order
 
-1. [Goals and principles](docs/01-goals.md)
-2. [Architecture, clients, and proposed workspace](docs/02-architecture.md)
-3. [Protocol and prediction concepts](docs/03-protocol.md)
-4. [Candidate libraries and projects](docs/04-candidates.md)
-5. [Open questions and research/build plan](docs/05-plan.md)
-6. [Confirmed decisions](docs/06-decisions.md)
-7. [Mosh source reference and findings](docs/07-mosh-reference.md)
-8. [Blit reuse, transports, ports, and alternatives](docs/08-blit-and-transports.md)
-9. [Transport reuse and server identity clarification](docs/09-transport-and-server-identity.md)
-10. [Current reuse boundary and remaining decisions](docs/10-reuse-and-remaining-decisions.md)
+1. [v1 specification](docs/11-v1-spec.md) — current product, protocol, and slice plan
+2. [Confirmed decisions](docs/06-decisions.md)
+3. [Goals and principles](docs/01-goals.md)
+4. [Architecture](docs/02-architecture.md)
+5. [Protocol concepts](docs/03-protocol.md)
+6. [Plan](docs/05-plan.md)
+7. Historical research: [candidates](docs/04-candidates.md), [Mosh](docs/07-mosh-reference.md), [Blit](docs/08-blit-and-transports.md), [identity](docs/09-transport-and-server-identity.md), [reuse notes](docs/10-reuse-and-remaining-decisions.md)
 
-## Confirmed decisions
+## v1 in one page
 
-Jesse confirmed the initial scope and browser authentication flow during the follow-up design discussion on 2026-09-17. See [decision record](docs/06-decisions.md). The first demo covers CLI and browser shell use, with no editor requirement; shells survive disconnects but not server restarts. Browser access uses one-time SSH-assisted passkey enrolment followed by independent passkey sign-in.
+- `quosh user@host` SSHs, creates a session on a **root** `quosh-server`, then speaks **WebTransport on UDP 443**.
+- New connect = new login shell. That process reconnects to the same session; closing it or `exit` ends the session.
+- Last-state-wins versioned screen updates (datagrams, reliable resync). No WebSocket.
+- Unix user is the tenancy boundary.
+- PWA origin will be `https://quosh.jtcs.dev`. Not built yet.
+- Unmodified `blit-alacritty` for VT parsing; Quosh owns transport, sessions, and (later) prediction.
 
-Deployment: static HTTPS PWA → direct connection to each user's server; no project-operated application backend or relay. Initial targets: Ubuntu server, macOS CLI, Chrome. Future goal: broad modern platforms and iOS/Android PWAs. One UDP port; no WebSocket fallback. One active controller with explicit takeover. License selection: GNU GPLv3.
+## Build
 
-## Provenance and decision status
+```bash
+cargo build --release -p quosh-server -p quosh
+```
 
-These notes capture Jesse's ideas and the proposals in the ChatGPT conversation “Browser Mosh Alternatives” (conversation ID `6aabdbe2-a65c-83ec-9d5e-13b3faf1db99`), reviewed on 2026-09-17. They also spell out design questions needed to evaluate those proposals.
-
-Firm direction: separate transport, synchronisation, prediction, and server/runtime; target CLI/browser/mobile; prefer QUIC/WebTransport while keeping transport pluggable; reuse existing components where appropriate.
-
-Crate boundaries, wire formats, dependencies, detailed authentication mechanics, terminal compatibility beyond the confirmed shell scope, and implementation order remain proposals. The confirmed decisions above supersede the original open alternatives. The initial prior-chat claims were unverified. The [Blit and transport research](docs/08-blit-and-transports.md) now records source-verified findings, corrections, and remaining validation needs. No runtime integration or performance claims have been verified.
+Install the binaries to `/usr/local/bin`, install `systemd/quosh-server.service`, then `systemctl enable --now quosh-server`. Connecting does not start or sudo the daemon.

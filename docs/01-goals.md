@@ -13,7 +13,9 @@ Mosh-quality ergonomics are a goal to measure, not a promised outcome. QUIC alon
 
 ## Confirmed first-demo scope
 
-A small CLI and browser demo must demonstrate the shared core. Shell use is required; editors are not required. Shell sessions survive client disconnects while the server runs, but do not survive server restarts. See [confirmed decisions](06-decisions.md).
+A small CLI and browser demo must demonstrate the shared core. Shell use is required; editors are not required. See [v1 spec](11-v1-spec.md).
+
+Session rule (Mosh, not “shells live after the client is gone”): the **live client process** reconnects to its session across network loss. Closing the client, hanging up, or `exit` ends the session. Unclean death may orphan a shell until the 7-day idle prompt. Sessions do not survive server restart.
 
 ## Initial non-goals
 
@@ -29,8 +31,8 @@ A small CLI and browser demo must demonstrate the shared core. Shell use is requ
 1. Transport moves messages; it does not interpret terminal cells or predict input.
 2. Synchronisation defines authoritative state and convergence independently of rendering and connection type.
 3. Prediction is optional, local, reversible, and never authoritative. Turning it off must preserve correctness.
-4. Server-side sessions outlive individual connections according to an explicit retention policy.
-5. Reuse first, but verify feature coverage and license compatibility before adopting or extracting code.
+4. A session outlives **transport** loss for one live client; it does not outlive that client process (except unclean-death orphans).
+5. Reuse unmodified third-party crates only. If a component needs a patch, rewrite it.
 6. Prefer current useful state over obsolete visual work, without dropping required delta dependencies or terminal side effects.
 7. Specify bounded buffers, recovery, and failure behavior alongside the happy path.
 8. Keep shared core logic separate from OS, browser, and frontend integrations.

@@ -1,6 +1,6 @@
 # Transport boundary and server identity clarification
 
-Recorded 2026-09-17 after Jesse questioned ordered Blit delivery and rejected requiring a domain/manual TLS setup on the shell server. Documentation only; implementation remains paused.
+Recorded 2026-09-17. Superseded operational details live in [11-v1-spec.md](11-v1-spec.md): PWA origin `https://quosh.jtcs.dev`, UDP 443, SSH prints cert hashes every CLI connect, no in-band refresh without SSH in v1.
 
 ## Reuse boundary
 
@@ -34,8 +34,4 @@ Jesse has now selected the static HTTPS PWA topology, with no project-operated a
 
 ## Open implementation questions
 
-- Static HTTPS PWA hosting is confirmed; specify its stable passkey relying-party identity and verification at the user server.
-- Trusted initial certificate fingerprint exchange through the agreed SSH bootstrap.
-- Authenticated publication/refresh of rotating fingerprints, including long-offline recovery.
-- Direct IP/port reachability and target-browser pinning support.
-- WebSocket fallback is resolved: omit it. Handle unavailable QUIC connectivity explicitly.
+Resolved for v1: RP ID is `quosh.jtcs.dev`; SSH helper returns the current SHA-256; long-offline refresh without SSH is deferred; UDP 443; no WebSocket.
