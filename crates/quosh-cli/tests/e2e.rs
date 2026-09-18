@@ -768,3 +768,58 @@ async fn cli_outage_banner_persists_across_ticks() {
     stack.proxy.set_delay(Duration::ZERO);
     let _ = tokio::time::timeout(Duration::from_secs(8), cli.child.wait()).await;
 }
+/// A hard path change (new IP, VPN) must not wait for QUIC's ~30 s idle
+/// timeout. Blackhole for longer than the client's liveness deadline but
+/// shorter than the QUIC idle timeout: the client must drop the stale
+/// connection and reattach, rather than let the old one quietly recover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_detects_dead_path_before_quic_idle_timeout() {
+    let stack = Stack::start().await;
+    let mut cli = CliPty::spawn(&stack);
+    let id = wait_session(&stack, Duration::from_secs(8)).await;
+    wait_attached(&stack, id, Duration::from_secs(8)).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let sess = stack
+        .sessions
+        .lock()
+        .await
+        .get(&id)
+        .cloned()
+        .expect("session");
+    let epoch = sess.current_epoch();
+
+    stack.proxy.blackhole();
+    // Keep draining the PTY: the client writes the outage banner
+    // synchronously, and a full PTY buffer would stall its event loop.
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while Instant::now() < deadline {
+        cli.pump();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let banner = cli.output().contains("without network");
+    stack.proxy.blackhole_off();
+    assert!(banner, "client never showed the outage banner");
+
+    let mut reconnected = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        cli.pump();
+        if sess.current_epoch() > epoch {
+            reconnected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        reconnected,
+        "client kept a stale connection past its liveness deadline; out:\n{}",
+        cli.output()
+    );
+
+    let (cmd, mark) = remote_printf("LIVE", "_OK");
+    cli.write(cmd.as_bytes());
+    cli.wait_for(&mark, Duration::from_secs(8)).await;
+    cli.write(b"exit\r");
+    let _ = tokio::time::timeout(Duration::from_secs(8), cli.child.wait()).await;
+}

@@ -571,6 +571,26 @@ fn input_overflowed() -> anyhow::Error {
     )
 }
 
+fn srtt_scaled(srtt_ms: Option<f64>, factor: f64) -> Duration {
+    srtt_ms
+        .map(|s| Duration::from_secs_f64((factor * s / 1000.0).min(20.0)))
+        .unwrap_or_default()
+}
+
+/// Re-probe when the outstanding probe goes unanswered. Clearing `ping_sent`
+/// only on pong meant a single lost pong stopped probing, so an idle link that
+/// recovered never woke up.
+fn ping_retry(srtt_ms: Option<f64>) -> Duration {
+    Duration::from_secs(2).max(srtt_scaled(srtt_ms, 2.0))
+}
+
+/// Declare the path dead when nothing at all has arrived for this long. QUIC
+/// only gives up after its ~30 s idle timeout, which makes an IP/VPN change
+/// look like a hang instead of a reconnect. Scaled for high-RTT links.
+fn link_dead(srtt_ms: Option<f64>) -> Duration {
+    Duration::from_secs(8).max(srtt_scaled(srtt_ms, 4.0))
+}
+
 /// A handshake that never completes. Used only after transport failures repeat,
 /// so a transient network interruption during attach is retried first.
 fn handshake_failed(reason: impl std::fmt::Display) -> anyhow::Error {
@@ -1154,11 +1174,23 @@ async fn session_loop(
                 render.tick()?;
             }
             _ = ping.tick() => {
-                // One probe outstanding at a time: overwriting `ping_sent`
-                // while a pong is pending would time an old pong against a new
-                // send and collapse a slow link's RTT to ~0.
-                if ping_sent.is_none() && feed.push_ctrl(encode_ping()) {
+                // One probe outstanding unless it goes unanswered; re-probing
+                // on a timeout keeps an idle link alive and lets a recovered
+                // path wake the connection back up.
+                let retry = ping_sent
+                    .map(|t| t.elapsed() >= ping_retry(srtt_ms))
+                    .unwrap_or(true);
+                if retry && feed.push_ctrl(encode_ping()) {
                     ping_sent = Some(Instant::now());
+                }
+                // QUIC's idle timeout is ~30 s; a hard path change (new IP,
+                // VPN) must not take that long to become a reconnect.
+                if last_ok.elapsed() >= link_dead(srtt_ms) {
+                    return if hello_ok {
+                        Ok(LinkEnd::Lost)
+                    } else {
+                        Ok(LinkEnd::HandshakeFailed)
+                    };
                 }
                 if last_ok.elapsed() > Duration::from_secs(OUTAGE_BANNER_SECS) {
                     let _ = render.set_outage(last_ok.elapsed());
@@ -1368,7 +1400,10 @@ mod tests {
         while writer.pending_bytes + chunk.len() <= TTY_PENDING_CAP {
             assert!(writer.send(chunk.clone()));
         }
-        assert!(!writer.send(chunk), "overflow must be reported, not dropped");
+        assert!(
+            !writer.send(chunk),
+            "overflow must be reported, not dropped"
+        );
     }
 
     #[test]

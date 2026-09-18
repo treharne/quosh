@@ -288,7 +288,10 @@ mod tests {
         let r2 = req;
         let (a, b) = tokio::join!(d1.create(uid, r1), d2.create(uid, r2));
         let oks = [a.ok, b.ok].into_iter().filter(|x| *x).count();
-        assert_eq!(oks, 1, "exactly one of two concurrent creates should succeed");
+        assert_eq!(
+            oks, 1,
+            "exactly one of two concurrent creates should succeed"
+        );
         let n = daemon
             .sessions
             .lock()
@@ -311,11 +314,7 @@ mod tests {
             for i in 0..MAX_PER_UID {
                 let mut id = [0u8; 16];
                 id[0] = i as u8;
-                let stub = StubSession::detached_for(
-                    id,
-                    uid,
-                    Duration::from_secs(IDLE_SECS + 60),
-                );
+                let stub = StubSession::detached_for(id, uid, Duration::from_secs(IDLE_SECS + 60));
                 g.insert(id, stub.sess.clone());
                 holds.push(stub);
             }

@@ -212,6 +212,14 @@ cargo test -p quosh-predict
    availability choice, not a correctness guarantee. Every terminal frame
    (Exit or a rejection Error) is followed by a bounded `send.finish()` so the
    connection is not dropped before the peer acks it.
+10. Liveness is application-level, not left to QUIC. The client pings every
+    second and re-probes if a pong is lost (a single lost pong must not stop
+    probing). If nothing arrives for `max(8s, 4*SRTT)` it drops the connection
+    and reconnects, instead of waiting for QUIC's ~30 s idle timeout — so an
+    IP/VPN path change becomes a reconnect in seconds. The remote session is
+    unaffected throughout: the PTY and shell live in the server's
+    `Session`/`Owner`, and the client re-attaches with the same session id and
+    token.
 
 Latency e2e (`crates/quosh-cli/tests/e2e.rs`): warm the epoch with one echoed
 character, slow the proxy to 400 ms each way, then assert the next character
