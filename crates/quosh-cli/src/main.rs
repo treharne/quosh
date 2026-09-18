@@ -15,7 +15,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
-use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::Command;
@@ -264,33 +263,66 @@ enum CtrlEvent {
 
 const UNACKED_CAP: usize = 256 * 1024;
 
-/// New open-file description so O_NONBLOCK does not leak onto stdout/stderr
-/// (those often share the tty's OFD with fd 0).
-fn open_tty_nonblock() -> io::Result<File> {
-    let f = std::fs::OpenOptions::new()
+/// Separate open of `/dev/tty` so we never change O_NONBLOCK on fd 0/1
+/// (those often share one open-file description). macOS kqueue rejects
+/// `/dev/tty` with tokio `AsyncFd` (EINVAL), so the reader uses `poll(2)`.
+fn open_tty() -> io::Result<File> {
+    std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open("/dev/tty")?;
-    // custom_flags is not enough on every Unix: AsyncFd requires O_NONBLOCK.
-    let fd = f.as_raw_fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(f)
+        .custom_flags(libc::O_CLOEXEC)
+        .open("/dev/tty")
 }
 
-async fn input_task(bytes: mpsc::Sender<Vec<u8>>, ctrl: mpsc::Sender<CtrlEvent>, tty: File) {
-    let afd = match AsyncFd::new(tty) {
-        Ok(a) => a,
-        Err(e) => {
-            let _ = ctrl.send(CtrlEvent::Failed(format!("async tty: {e}"))).await;
-            return;
-        }
-    };
+fn spawn_tty_reader(bytes: mpsc::Sender<Vec<u8>>, ctrl: mpsc::Sender<CtrlEvent>, tty: File) {
+    std::thread::Builder::new()
+        .name("quosh-tty".into())
+        .spawn(move || {
+            let fd = tty.as_raw_fd();
+            let mut buf = [0u8; 4096];
+            loop {
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let pr = unsafe { libc::poll(&mut pfd, 1, -1) };
+                if pr < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    let _ = ctrl.blocking_send(CtrlEvent::Failed(format!("tty poll: {e}")));
+                    break;
+                }
+                if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                    let _ = ctrl.blocking_send(CtrlEvent::Eof);
+                    break;
+                }
+                if pfd.revents & libc::POLLIN == 0 {
+                    continue;
+                }
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                if n < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    let _ = ctrl.blocking_send(CtrlEvent::Failed(format!("tty read: {e}")));
+                    break;
+                }
+                if n == 0 {
+                    let _ = ctrl.blocking_send(CtrlEvent::Eof);
+                    break;
+                }
+                if bytes.blocking_send(buf[..n as usize].to_vec()).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("spawn tty thread");
+}
+
+async fn signal_task(ctrl: mpsc::Sender<CtrlEvent>) {
     let mut sigwinch = match signal(SignalKind::window_change()) {
         Ok(s) => s,
         Err(e) => {
@@ -312,47 +344,12 @@ async fn input_task(bytes: mpsc::Sender<Vec<u8>>, ctrl: mpsc::Sender<CtrlEvent>,
             return;
         }
     };
-    let mut buf = [0u8; 4096];
     loop {
         tokio::select! {
-            r = afd.readable() => {
-                let Ok(mut g) = r else { break };
-                let n = match g.try_io(|inner| {
-                    let fd = inner.get_ref().as_raw_fd();
-                    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-                    if n < 0 {
-                        Err(std::io::Error::last_os_error())
-                    } else {
-                        Ok(n as usize)
-                    }
-                }) {
-                    Ok(Ok(n)) => n,
-                    Ok(Err(_)) => break,
-                    Err(_would_block) => continue,
-                };
-                if n == 0 {
-                    let _ = ctrl.send(CtrlEvent::Eof).await;
+            _ = sigwinch.recv() => {
+                if ctrl.send(CtrlEvent::Winch).await.is_err() {
                     break;
                 }
-                let chunk = buf[..n].to_vec();
-                tokio::select! {
-                    r = bytes.send(chunk) => {
-                        if r.is_err() {
-                            break;
-                        }
-                    }
-                    _ = sigint.recv() => {
-                        let _ = ctrl.send(CtrlEvent::Interrupt).await;
-                        break;
-                    }
-                    _ = sighup.recv() => {
-                        let _ = ctrl.send(CtrlEvent::Hangup).await;
-                        break;
-                    }
-                }
-            }
-            _ = sigwinch.recv() => {
-                let _ = ctrl.send(CtrlEvent::Winch).await;
             }
             _ = sigint.recv() => {
                 let _ = ctrl.send(CtrlEvent::Interrupt).await;
@@ -387,9 +384,10 @@ async fn run_session(
 
     let (bytes_tx, mut bytes_rx) = mpsc::channel::<Vec<u8>>(8);
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<CtrlEvent>(8);
-    match open_tty_nonblock() {
+    match open_tty() {
         Ok(tty) => {
-            tokio::spawn(input_task(bytes_tx, ctrl_tx, tty));
+            spawn_tty_reader(bytes_tx, ctrl_tx.clone(), tty);
+            tokio::spawn(signal_task(ctrl_tx));
         }
         Err(e) => {
             bail!("open /dev/tty for input: {e}");
