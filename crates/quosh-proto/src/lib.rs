@@ -138,7 +138,7 @@ impl FrameFeed {
     }
 }
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const WT_PATH: &str = "/quosh";
 pub const DEFAULT_PORT: u16 = 443;
 pub const CONNECT_PREFIX: &str = "QUOSH CONNECT";
@@ -226,6 +226,8 @@ pub fn split_frame(buf: &mut Vec<u8>) -> Result<Option<(u8, Vec<u8>)>> {
 }
 
 pub struct Hello {
+    /// Wire protocol version. Must equal [`PROTOCOL_VERSION`].
+    pub protocol: u16,
     pub session_id: [u8; 16],
     pub token: [u8; 32],
     pub cols: u16,
@@ -234,7 +236,8 @@ pub struct Hello {
 
 impl Hello {
     pub fn encode(&self) -> Vec<u8> {
-        let mut p = Vec::with_capacity(52);
+        let mut p = Vec::with_capacity(54);
+        p.extend_from_slice(&self.protocol.to_le_bytes());
         p.extend_from_slice(&self.session_id);
         p.extend_from_slice(&self.token);
         p.extend_from_slice(&self.cols.to_le_bytes());
@@ -243,19 +246,22 @@ impl Hello {
     }
 
     pub fn decode(p: &[u8]) -> Result<Self> {
-        if p.len() != 52 {
+        if p.len() != 54 {
             return Err(Error::Frame);
         }
         Ok(Self {
-            session_id: p[0..16].try_into().unwrap(),
-            token: p[16..48].try_into().unwrap(),
-            cols: u16::from_le_bytes(p[48..50].try_into().unwrap()),
-            rows: u16::from_le_bytes(p[50..52].try_into().unwrap()),
+            protocol: u16::from_le_bytes(p[0..2].try_into().unwrap()),
+            session_id: p[2..18].try_into().unwrap(),
+            token: p[18..50].try_into().unwrap(),
+            cols: u16::from_le_bytes(p[50..52].try_into().unwrap()),
+            rows: u16::from_le_bytes(p[52..54].try_into().unwrap()),
         })
     }
 }
 
 pub struct HelloOk {
+    /// Wire protocol version, so a mismatched client fails loudly.
+    pub protocol: u16,
     pub session_id: [u8; 16],
     pub version: u64,
     pub cols: u16,
@@ -264,7 +270,8 @@ pub struct HelloOk {
 
 impl HelloOk {
     pub fn encode(&self) -> Vec<u8> {
-        let mut p = Vec::with_capacity(28);
+        let mut p = Vec::with_capacity(30);
+        p.extend_from_slice(&self.protocol.to_le_bytes());
         p.extend_from_slice(&self.session_id);
         p.extend_from_slice(&self.version.to_le_bytes());
         p.extend_from_slice(&self.cols.to_le_bytes());
@@ -273,14 +280,15 @@ impl HelloOk {
     }
 
     pub fn decode(p: &[u8]) -> Result<Self> {
-        if p.len() != 28 {
+        if p.len() != 30 {
             return Err(Error::Frame);
         }
         Ok(Self {
-            session_id: p[0..16].try_into().unwrap(),
-            version: u64::from_le_bytes(p[16..24].try_into().unwrap()),
-            cols: u16::from_le_bytes(p[24..26].try_into().unwrap()),
-            rows: u16::from_le_bytes(p[26..28].try_into().unwrap()),
+            protocol: u16::from_le_bytes(p[0..2].try_into().unwrap()),
+            session_id: p[2..18].try_into().unwrap(),
+            version: u64::from_le_bytes(p[18..26].try_into().unwrap()),
+            cols: u16::from_le_bytes(p[26..28].try_into().unwrap()),
+            rows: u16::from_le_bytes(p[28..30].try_into().unwrap()),
         })
     }
 }
@@ -777,6 +785,7 @@ mod tests {
     #[test]
     fn hello_and_connect_line() {
         let h = Hello {
+            protocol: PROTOCOL_VERSION,
             session_id: [1; 16],
             token: [2; 32],
             cols: 80,
@@ -788,12 +797,34 @@ mod tests {
         assert_eq!(typ, MSG_HELLO);
         let d = Hello::decode(&payload).unwrap();
         assert_eq!(d.cols, 80);
+        assert_eq!(d.protocol, PROTOCOL_VERSION);
         let line = format_connect_line(443, &[9; 32], &[1; 16], &[2; 32]);
         let (port, hash, sid, tok) = parse_connect_line(&line).unwrap();
         assert_eq!(port, 443);
         assert_eq!(hash, [9; 32]);
         assert_eq!(sid, [1; 16]);
         assert_eq!(tok, [2; 32]);
+    }
+
+    #[test]
+    fn hello_ok_carries_protocol_and_rejects_old_layout() {
+        let h = HelloOk {
+            protocol: PROTOCOL_VERSION,
+            session_id: [3; 16],
+            version: 7,
+            cols: 80,
+            rows: 24,
+        };
+        let mut buf = h.encode();
+        let (typ, payload) = split_frame(&mut buf).unwrap().unwrap();
+        assert_eq!(typ, MSG_HELLO_OK);
+        let d = HelloOk::decode(&payload).unwrap();
+        assert_eq!(d.protocol, PROTOCOL_VERSION);
+        assert_eq!(d.version, 7);
+        assert_eq!(d.cols, 80);
+        assert_eq!(d.session_id, [3; 16]);
+        // The pre-echo_ack layout did not carry a protocol field.
+        assert!(HelloOk::decode(&payload[..28]).is_err());
     }
 
     #[test]

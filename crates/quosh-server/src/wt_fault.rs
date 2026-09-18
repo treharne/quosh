@@ -7,8 +7,8 @@ use crate::session::{Session, StubSession, spawn_pair};
 use crate::transport::handle_incoming;
 use nix::unistd::Uid;
 use quosh_proto::{
-    Hello, MSG_ERROR, MSG_EXIT, MSG_HELLO_OK, MSG_PONG, WT_PATH, encode_input, encode_ping,
-    encode_resize, split_frame,
+    Hello, MSG_ERROR, MSG_EXIT, MSG_HELLO_OK, MSG_PONG, PROTOCOL_VERSION, WT_PATH, encode_input,
+    encode_ping, encode_resize, split_frame,
 };
 use rand::RngCore;
 use std::net::SocketAddr;
@@ -96,8 +96,7 @@ impl UdpProxy {
     }
 
     fn set_delay(&self, d: Duration) {
-        self.delay_ms
-            .store(d.as_millis() as u64, Ordering::SeqCst);
+        self.delay_ms.store(d.as_millis() as u64, Ordering::SeqCst);
     }
 
     fn set_drop_pct(&self, pct: u32) {
@@ -180,9 +179,11 @@ impl Harness {
     }
 
     async fn connect(&self) -> WtSession {
-        let url =
-            url::Url::parse(&format!("https://127.0.0.1:{}{WT_PATH}", self.proxy.addr.port()))
-                .unwrap();
+        let url = url::Url::parse(&format!(
+            "https://127.0.0.1:{}{WT_PATH}",
+            self.proxy.addr.port()
+        ))
+        .unwrap();
         let client = web_transport_quinn::ClientBuilder::new()
             .with_server_certificate_hashes(vec![self.hash.to_vec()])
             .expect("wt client");
@@ -247,6 +248,7 @@ impl Ctrl {
         let (mut send, recv) = wt.open_bi().await.expect("open_bi");
         send.write_all(
             &Hello {
+                protocol: PROTOCOL_VERSION,
                 session_id: sess.id,
                 token: sess.token,
                 cols,
@@ -438,7 +440,10 @@ async fn wt_blackholed_connection_during_hangup() {
     let sess = h.insert_stub().await;
     let mut c = Ctrl::attach(&h, &sess, 80, 24).await;
     let _ = c.expect(MSG_HELLO_OK).await;
-    wait_until(Duration::from_secs(2), || async { h.live_transports() == 1 }).await;
+    wait_until(Duration::from_secs(2), || async {
+        h.live_transports() == 1
+    })
+    .await;
 
     // Stop ACKs, then queue more than a typical QUIC stream window so
     // send.write actually blocks. A tiny Exit frame would otherwise sit in
@@ -448,8 +453,10 @@ async fn wt_blackholed_connection_during_hangup() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     sess.publish_exit(3);
     let start = Instant::now();
-    wait_until(Duration::from_millis(800), || async { h.live_transports() == 0 })
-        .await;
+    wait_until(Duration::from_millis(800), || async {
+        h.live_transports() == 0
+    })
+    .await;
     let elapsed = start.elapsed();
     assert!(
         elapsed >= Duration::from_millis(250),
@@ -508,4 +515,43 @@ async fn wt_lossy_link_still_accepts_input() {
 #[ignore = "opt-in soak; 5s smoke is wt_lossy_link_still_accepts_input"]
 async fn wt_lossy_link_soak_long() {
     run_wt_lossy_soak(60).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wt_rejects_wrong_protocol_version() {
+    let h = Harness::start().await;
+    let sess = h.insert_stub().await;
+    let wt = h.connect().await;
+    let (mut send, mut recv) = wt.open_bi().await.expect("open_bi");
+    send.write_all(
+        &Hello {
+            protocol: PROTOCOL_VERSION + 1,
+            session_id: sess.id,
+            token: sess.token,
+            cols: 80,
+            rows: 24,
+        }
+        .encode(),
+    )
+    .await
+    .expect("hello");
+
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        if let Some((typ, payload)) = split_frame(&mut buf).expect("split") {
+            assert_eq!(typ, MSG_ERROR, "expected a protocol error frame");
+            let (code, msg) = quosh_proto::decode_error(&payload).expect("error");
+            assert_eq!(code, 4);
+            assert!(msg.contains("protocol"), "message was {msg:?}");
+            return;
+        }
+        let n = tokio::time::timeout(Duration::from_secs(2), recv.read(&mut tmp))
+            .await
+            .expect("timeout waiting for error")
+            .expect("read")
+            .unwrap_or(0);
+        assert!(n > 0, "eof before error frame");
+        buf.extend_from_slice(&tmp[..n]);
+    }
 }

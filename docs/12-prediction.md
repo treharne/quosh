@@ -87,8 +87,9 @@ reliable resync resend it.
 ### Input sequence mapping
 
 One `MSG_INPUT` message carries one sequence number. Every prediction created
-while processing the bytes of that message uses `expiration_frame = seq`; the
-client calls `set_local_frame_sent(seq)` once before the byte loop, exactly as
+while processing the bytes of that message uses `expiration_frame = seq`. The
+predictor expires at `local_frame_sent + 1` (Mosh's convention), so the client
+calls `set_local_frame_sent(seq - 1)` once before the byte loop, exactly as
 Mosh's `process_user_input` sets it once per read. A multi-byte message is
 therefore acknowledged as a unit. Queued offline input keeps the sequence it
 was assigned; prediction is reset on transport loss, so no stale expirations

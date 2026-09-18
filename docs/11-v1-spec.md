@@ -79,8 +79,8 @@ WebTransport session to path `/quosh`.
 
 | Type | Name | Direction | Body |
 |---|---|---|---|
-| 1 | Hello | C→S | `session_id` 16 bytes, `token` 32 bytes, `cols` u16, `rows` u16 |
-| 2 | HelloOk | S→C | `session_id` 16 bytes, `version` u64, `cols` u16, `rows` u16 |
+| 1 | Hello | C→S | `protocol` u16, `session_id` 16 bytes, `token` 32 bytes, `cols` u16, `rows` u16 |
+| 2 | HelloOk | S→C | `protocol` u16, `session_id` 16 bytes, `version` u64, `cols` u16, `rows` u16 |
 | 3 | Input | C→S | `seq` u64, `data` bytes |
 | 4 | Resize | C→S | `cols` u16, `rows` u16 |
 | 5 | Hangup | C→S | empty |
@@ -155,6 +155,8 @@ Automatically generated ECDSA P-256 self-signed certificate, validity ≤ 14 day
 ## Outage banner (CLI)
 
 If no successful communication for 3 seconds, show an elapsed-time banner on the last screen row (Mosh-style). Keep accepting and queueing input. Do not require a confirm-to-send step. Clear the banner on resume.
+
+`Ctrl-^ .` quits the client (Mosh's escape). The client/server `protocol` field in Hello/HelloOk must match; a mismatch is a fatal error, and an unknown session or bad token is fatal too rather than a reconnect loop.
 
 ## Slice 1 acceptance
 

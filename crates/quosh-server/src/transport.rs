@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 use quosh_proto::{
     FrameFeed, Hello, HelloOk, MAX_FRAME, MAX_INPUT_BYTES, MSG_ACK_STATE, MSG_HANGUP, MSG_HELLO,
-    MSG_INPUT, MSG_PING, MSG_RESIZE, WT_PATH, decode_input, decode_resize, decode_u64,
-    encode_error, encode_exit, encode_frame, encode_input_ack, encode_pong, peek_len, split_frame,
+    MSG_INPUT, MSG_PING, MSG_RESIZE, PROTOCOL_VERSION, WT_PATH, decode_input, decode_resize,
+    decode_u64, encode_error, encode_exit, encode_frame, encode_input_ack, encode_pong, peek_len,
+    split_frame,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -39,7 +40,30 @@ pub async fn handle_incoming(incoming: IncomingSession, sessions: Registry) -> R
                 send.write_all(&encode_error(1, "expected hello")).await?;
                 bail!("expected hello got {typ}");
             }
-            break Hello::decode(&payload)?;
+            match Hello::decode(&payload) {
+                Ok(hello) if hello.protocol == PROTOCOL_VERSION => break hello,
+                Ok(hello) => {
+                    let _ = send
+                        .write_all(&encode_error(
+                            4,
+                            "protocol version mismatch; update quosh-server",
+                        ))
+                        .await;
+                    bail!("protocol version {} != {PROTOCOL_VERSION}", hello.protocol);
+                }
+                Err(e) => {
+                    // A client speaking an older layout: try to say so before
+                    // dropping, since it will otherwise just see a closed
+                    // stream.
+                    let _ = send
+                        .write_all(&encode_error(
+                            4,
+                            "protocol version mismatch; update quosh-server",
+                        ))
+                        .await;
+                    bail!("undecodable hello: {e}");
+                }
+            }
         }
     };
 
@@ -116,6 +140,7 @@ async fn run_transport(
     let mut feed = FrameFeed::default();
     let _ = feed.push_ctrl(
         HelloOk {
+            protocol: PROTOCOL_VERSION,
             session_id: sess.id,
             version,
             cols,
@@ -228,6 +253,11 @@ async fn run_transport(
             break;
         }
     }
+    // Dropping the connection discards unacknowledged stream data, which can
+    // race the final Exit frame (intermittent ApplicationClosed on the client).
+    // Wait briefly for the peer to ack, bounded because a blackholed or
+    // replaced peer never will.
+    let _ = tokio::time::timeout(Duration::from_millis(150), send.finish()).await;
     Ok(())
 }
 

@@ -340,6 +340,21 @@ impl CliPty {
         }
     }
 
+    /// Pump until `pred` accepts the collected output, or `limit` elapses.
+    async fn wait_until(&mut self, limit: Duration, mut pred: impl FnMut(&str) -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            self.pump();
+            if pred(&self.output()) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     fn icanon(&self) -> bool {
         unsafe {
             let mut t = std::mem::zeroed();
@@ -381,6 +396,27 @@ async fn wait_attached(stack: &Stack, id: [u8; 16], limit: Duration) {
     })
     .await
     .expect("CLI did not attach WebTransport");
+}
+
+/// The most recent full repaint, which `paint_frame` starts with a clear+home.
+fn last_repaint(output: &str) -> &str {
+    output.rsplit("\x1b[?25l\x1b[H\x1b[2J").next().unwrap_or("")
+}
+
+/// Whether `needle` in the latest repaint is drawn underlined. Adaptive
+/// prediction underlines speculative cells, so this distinguishes a prediction
+/// from the authoritative echo that replaces it.
+fn underlined_in_last_repaint(output: &str, needle: char) -> bool {
+    let repaint = last_repaint(output);
+    let Some(pos) = repaint.rfind(needle) else {
+        return false;
+    };
+    let before = &repaint[..pos];
+    let Some(start) = before.rfind("\x1b[") else {
+        return false;
+    };
+    let seq = &before[start..];
+    seq.contains(";4") || seq.starts_with("\x1b[4")
 }
 
 fn remote_printf(left: &str, right: &str) -> (String, String) {
@@ -547,8 +583,23 @@ async fn cli_predicts_before_the_echo_arrives() {
         "adaptive prediction must draw 'Z' well before the ~800 ms echo; output:\n{}",
         cli.output()
     );
-    // The authoritative echo eventually confirms it.
-    cli.wait_for("Z", Duration::from_secs(6)).await;
+    assert!(
+        underlined_in_last_repaint(&cli.output(), 'Z'),
+        "the early 'Z' must be a speculative (underlined) prediction"
+    );
+
+    // Independently prove the authoritative echo arrived: it repaints the same
+    // cell without the prediction underline.
+    let confirmed = cli
+        .wait_until(Duration::from_secs(6), |o| {
+            last_repaint(o).contains('Z') && !underlined_in_last_repaint(o, 'Z')
+        })
+        .await;
+    assert!(
+        confirmed,
+        "the authoritative echo must repaint 'Z' without the prediction underline; output:\n{}",
+        cli.output()
+    );
     stack.proxy.set_delay(Duration::ZERO);
 }
 
@@ -606,4 +657,63 @@ async fn cli_silent_input_is_not_predicted() {
     cli.write(b"\r");
     cli.write(b"exit\r");
     let _ = tokio::time::timeout(Duration::from_secs(8), cli.child.wait()).await;
+}
+
+/// Bulk input must clear any existing prediction immediately, not leave the
+/// overlay on screen until some later frame happens to repaint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_bulk_input_clears_predictions() {
+    let stack = Stack::start().await;
+    let mut cli = CliPty::spawn(&stack);
+    let id = wait_session(&stack, Duration::from_secs(8)).await;
+    wait_attached(&stack, id, Duration::from_secs(8)).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    cli.write(b"w");
+    cli.wait_for("w", Duration::from_secs(8)).await;
+    stack.proxy.set_delay(Duration::from_millis(400));
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    cli.write(b"Z");
+    assert!(
+        cli.wait_until(Duration::from_millis(300), |o| {
+            underlined_in_last_repaint(o, 'Z')
+        })
+        .await,
+        "expected a speculative 'Z' first; output:\n{}",
+        cli.output()
+    );
+
+    // Well over the 100-byte threshold: the CLI resets and repaints at once.
+    cli.write(&vec![b'a'; 512]);
+    let cleared = cli
+        .wait_until(Duration::from_millis(400), |o| {
+            !last_repaint(o).contains('Z')
+        })
+        .await;
+    assert!(
+        cleared,
+        "bulk input must clear the pending prediction immediately; output:\n{}",
+        cli.output()
+    );
+    stack.proxy.set_delay(Duration::ZERO);
+    let _ = tokio::time::timeout(Duration::from_secs(8), cli.child.wait()).await;
+}
+
+/// `Ctrl-^ .` must quit the client cleanly even though raw mode swallows
+/// Ctrl+C as remote input.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_quit_sequence_exits() {
+    let stack = Stack::start().await;
+    let mut cli = CliPty::spawn(&stack);
+    let id = wait_session(&stack, Duration::from_secs(8)).await;
+    wait_attached(&stack, id, Duration::from_secs(8)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    cli.write(&[0x1e, b'.']);
+    let st = tokio::time::timeout(Duration::from_secs(8), cli.child.wait())
+        .await
+        .expect("client did not quit on Ctrl-^ .")
+        .expect("wait");
+    assert_eq!(st.code(), Some(0), "clean quit expected, got {st:?}");
+    assert!(cli.icanon(), "RawMode drop must restore ICANON");
 }

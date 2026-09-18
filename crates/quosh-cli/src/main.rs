@@ -5,9 +5,9 @@ use quosh_predict::{DisplayPreference, Predictor};
 use quosh_proto::{
     CONNECT_PREFIX, DEFAULT_PORT, FrameFeed, Hello, HelloOk, HelperRequest, HelperResponse,
     MODE_BRACKETED_PASTE, MODE_CURSOR_VISIBLE, MSG_ERROR, MSG_EXIT, MSG_HELLO_OK, MSG_INPUT_ACK,
-    MSG_PONG, MSG_SCREEN, OUTAGE_BANNER_SECS, Screen, WT_PATH, decode_error, decode_exit,
-    decode_u64, encode_ack_state, encode_hangup, encode_input, encode_ping, encode_resize,
-    frame_ansi, parse_connect_line, split_frame,
+    MSG_PONG, MSG_SCREEN, OUTAGE_BANNER_SECS, PROTOCOL_VERSION, Screen, WT_PATH, decode_error,
+    decode_exit, decode_u64, encode_ack_state, encode_hangup, encode_input, encode_ping,
+    encode_resize, frame_ansi, parse_connect_line, split_frame,
 };
 use std::fs::File;
 use std::future::Future;
@@ -290,12 +290,46 @@ fn dup_stdin() -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(n) })
 }
 
+/// Mosh's escape key: `Ctrl-^`, and `Ctrl-^ .` quits the client. If the
+/// escape key is followed by anything else, both bytes are forwarded so the
+/// key can still be typed through.
+const ESCAPE_KEY: u8 = 0x1e;
+const QUIT_KEY: u8 = b'.';
+
+/// Process one read. `escape` carries a pending `Ctrl-^` across reads. Returns
+/// the bytes to forward and whether the quit sequence completed.
+fn filter_input(bytes: &[u8], escape: &mut bool) -> (Vec<u8>, bool) {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut quit = false;
+    for &b in bytes {
+        if !*escape {
+            if b == ESCAPE_KEY {
+                *escape = true;
+            } else {
+                out.push(b);
+            }
+        } else {
+            *escape = false;
+            if b == QUIT_KEY {
+                quit = true;
+                break;
+            }
+            out.push(ESCAPE_KEY);
+            if b != ESCAPE_KEY {
+                out.push(b);
+            }
+        }
+    }
+    (out, quit)
+}
+
 fn spawn_tty_reader(bytes: mpsc::Sender<Vec<u8>>, ctrl: mpsc::Sender<CtrlEvent>, tty: File) {
     std::thread::Builder::new()
         .name("quosh-tty".into())
         .spawn(move || {
             let fd = tty.as_raw_fd();
             let mut buf = [0u8; 4096];
+            let mut escape = false;
             loop {
                 let mut pfd = libc::pollfd {
                     fd,
@@ -331,7 +365,12 @@ fn spawn_tty_reader(bytes: mpsc::Sender<Vec<u8>>, ctrl: mpsc::Sender<CtrlEvent>,
                     let _ = ctrl.blocking_send(CtrlEvent::Eof);
                     break;
                 }
-                if bytes.blocking_send(buf[..n as usize].to_vec()).is_err() {
+                let (out, quit) = filter_input(&buf[..n as usize], &mut escape);
+                if !out.is_empty() && bytes.blocking_send(out).is_err() {
+                    break;
+                }
+                if quit {
+                    let _ = ctrl.blocking_send(CtrlEvent::Hangup);
                     break;
                 }
             }
@@ -382,12 +421,41 @@ async fn signal_task(ctrl: mpsc::Sender<CtrlEvent>) {
 
 const PASTE_BYTES: usize = 100;
 
+/// A condition that reconnecting cannot fix: server rejection, protocol
+/// mismatch, or an unknown/expired session. `run_session` stops on these.
+#[derive(Debug)]
+struct FatalServer(String);
+
+impl std::fmt::Display for FatalServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FatalServer {}
+
+fn fatal(msg: impl Into<String>) -> anyhow::Error {
+    FatalServer(msg.into()).into()
+}
+
+/// A control stream that closes before `HelloOk` is a server-side rejection,
+/// not a network drop we should retry.
+fn handshake_closed() -> anyhow::Error {
+    fatal(
+        "server closed the connection during the handshake \
+         (is quosh-server up to date with this client?)",
+    )
+}
+
 /// Owns the confirmed screen, the predictor, and the last displayed frame.
 /// Every repaint starts from confirmed state and reapplies predictions.
 struct Render {
     predictor: Predictor,
     screen: Option<Screen>,
     display: Option<FrameState>,
+    /// The outage banner is drawn outside `display`, so a repaint must not be
+    /// skipped while it is on screen.
+    banner_shown: bool,
     start: Instant,
 }
 
@@ -403,6 +471,7 @@ impl Render {
             predictor,
             screen: None,
             display: None,
+            banner_shown: false,
             start: Instant::now(),
         }
     }
@@ -454,8 +523,10 @@ impl Render {
     /// matching the server's echo checkpoint exactly.
     fn predict(&mut self, seq: u64, bytes: &[u8]) -> io::Result<()> {
         if bytes.len() > PASTE_BYTES {
+            // Bulk input is not predicted. Repaint immediately so any existing
+            // overlay is removed instead of lingering until the next frame.
             self.predictor.reset();
-            return Ok(());
+            return self.repaint();
         }
         let Some(screen) = self.screen.as_ref() else {
             return Ok(());
@@ -489,12 +560,14 @@ impl Render {
         let mut frame = screen.frame.clone();
         self.predictor.apply(&mut frame);
         // Predictions are always generated, but on a fast link `apply` leaves
-        // the frame unchanged. Skip the write so timer ticks are silent.
-        if self.display.as_ref() == Some(&frame) {
+        // the frame unchanged. Skip the write so timer ticks are silent, unless
+        // the banner has to be cleared from the screen.
+        if !self.banner_shown && self.display.as_ref() == Some(&frame) {
             return Ok(());
         }
         paint_frame(&frame, true)?;
         self.display = Some(frame);
+        self.banner_shown = false;
         Ok(())
     }
 
@@ -503,7 +576,9 @@ impl Render {
             .display
             .clone()
             .or_else(|| self.screen.as_ref().map(|s| s.frame.clone()));
-        paint_banner(elapsed, frame.as_ref())
+        paint_banner(elapsed, frame.as_ref())?;
+        self.banner_shown = true;
+        Ok(())
     }
 }
 
@@ -578,6 +653,11 @@ async fn run_session(
                         {
                             Ok(true) => break Ok(()),
                             Ok(false) => {}
+                            Err(e) if e.downcast_ref::<FatalServer>().is_some() => {
+                                // Unknown session, bad token, or protocol
+                                // mismatch: reconnecting cannot help.
+                                break Err(e);
+                            }
                             Err(e) => {
                                 let io_kind = e.downcast_ref::<io::Error>().map(|ie| ie.kind());
                                 if io_kind != Some(io::ErrorKind::WouldBlock) {
@@ -727,6 +807,7 @@ async fn session_loop(
     let mut feed = FrameFeed::default();
     let _ = feed.push_ctrl(
         Hello {
+            protocol: PROTOCOL_VERSION,
             session_id,
             token,
             cols: *cols,
@@ -744,12 +825,20 @@ async fn session_loop(
     let mut last_mode: u16 = 0;
     let mut srtt_ms: Option<f64> = None;
     let mut ping_sent: Option<Instant> = None;
+    let mut hello_ok = false;
 
     loop {
         while let Some((typ, payload)) = split_frame(&mut buf)? {
             match typ {
                 MSG_HELLO_OK => {
-                    let _ = HelloOk::decode(&payload)?;
+                    let hello = HelloOk::decode(&payload)?;
+                    if hello.protocol != PROTOCOL_VERSION {
+                        return Err(fatal(format!(
+                            "server protocol {} != client {PROTOCOL_VERSION}; update the other side",
+                            hello.protocol
+                        )));
+                    }
+                    hello_ok = true;
                 }
                 MSG_SCREEN => {
                     if let Ok(s) = Screen::decode_compressed(&payload) {
@@ -786,7 +875,7 @@ async fn session_loop(
                 }
                 MSG_ERROR => {
                     let (c, m) = decode_error(&payload)?;
-                    bail!("server error {c}: {m}");
+                    return Err(fatal(format!("server error {c}: {m}")));
                 }
                 _ => {}
             }
@@ -802,7 +891,7 @@ async fn session_loop(
             n = recv.read(&mut tmp_recv) => {
                 let n = n?.unwrap_or(0);
                 if n == 0 {
-                    return Ok(false);
+                    return if hello_ok { Ok(false) } else { Err(handshake_closed()) };
                 }
                 *last_ok = Instant::now();
                 buf.extend_from_slice(&tmp_recv[..n]);
@@ -819,14 +908,14 @@ async fn session_loop(
                             showing_outage = false;
                         }
                     }
-                    Err(_) => return Ok(false),
+                    Err(_) => return if hello_ok { Ok(false) } else { Err(handshake_closed()) },
                 }
             }
             n = send.write(feed.rest()), if feed.writing() => {
                 match n {
-                    Ok(0) => return Ok(false),
+                    Ok(0) => return if hello_ok { Ok(false) } else { Err(handshake_closed()) },
                     Ok(n) => feed.advance(n),
-                    Err(_) => return Ok(false),
+                    Err(_) => return if hello_ok { Ok(false) } else { Err(handshake_closed()) },
                 }
             }
             ev = ctrl_rx.recv() => {
@@ -864,8 +953,12 @@ async fn session_loop(
                 render.tick()?;
             }
             _ = ping.tick() => {
-                ping_sent = Some(Instant::now());
-                let _ = feed.push_ctrl(encode_ping());
+                // One probe outstanding at a time: overwriting `ping_sent`
+                // while a pong is pending would time an old pong against a new
+                // send and collapse a slow link's RTT to ~0.
+                if ping_sent.is_none() && feed.push_ctrl(encode_ping()) {
+                    ping_sent = Some(Instant::now());
+                }
                 if last_ok.elapsed() > Duration::from_secs(OUTAGE_BANNER_SECS) {
                     let _ = render.show_banner(last_ok.elapsed());
                     showing_outage = true;
@@ -952,7 +1045,7 @@ fn paint_banner(elapsed: Duration, frame: Option<&FrameState>) -> io::Result<()>
     let secs = elapsed.as_secs();
     write!(
         out,
-        "\x1b[s\x1b[{};1H\x1b[7m quosh: {secs} seconds without network \x1b[0m\x1b[K\x1b[u",
+        "\x1b[s\x1b[{};1H\x1b[7m quosh: {secs} seconds without network  [Ctrl-^ . to quit] \x1b[0m\x1b[K\x1b[u",
         frame.map(|f| f.rows()).unwrap_or(24)
     )?;
     out.flush()
@@ -1008,5 +1101,41 @@ impl Drop for RawMode {
             }
         }
         let _ = io::stdout().write_all(b"\x1b[?2004l\x1b[?25h\r\n");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quit_sequence_is_consumed_and_other_keys_forwarded() {
+        let mut escape = false;
+        assert_eq!(filter_input(b"ab", &mut escape), (b"ab".to_vec(), false));
+        assert!(!escape);
+
+        // Ctrl-^ . quits, and the escape key is not forwarded.
+        assert_eq!(filter_input(&[ESCAPE_KEY], &mut escape), (vec![], false));
+        assert!(escape);
+        assert_eq!(filter_input(&[QUIT_KEY], &mut escape), (vec![], true));
+        assert!(!escape);
+
+        // Ctrl-^ x forwards both bytes.
+        let mut escape = false;
+        assert_eq!(
+            filter_input(&[ESCAPE_KEY, b'x'], &mut escape),
+            (vec![ESCAPE_KEY, b'x'], false)
+        );
+
+        // Ctrl-^ Ctrl-^ sends one literal Ctrl-^.
+        let mut escape = false;
+        assert_eq!(
+            filter_input(&[ESCAPE_KEY, ESCAPE_KEY], &mut escape),
+            (vec![ESCAPE_KEY], false)
+        );
+
+        // '.' alone is ordinary input.
+        let mut escape = false;
+        assert_eq!(filter_input(b".", &mut escape), (b".".to_vec(), false));
     }
 }
