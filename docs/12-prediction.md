@@ -220,6 +220,9 @@ cargo test -p quosh-predict
     unaffected throughout: the PTY and shell live in the server's
     `Session`/`Owner`, and the client re-attaches with the same session id and
     token.
+11. The terminal tab is labelled `quosh: user@host` via OSC 2 (with an
+    `(offline)` suffix while disconnected), and the shell's previous title is
+    saved/restored with the xterm title stack.
 
 Latency e2e (`crates/quosh-cli/tests/e2e.rs`): warm the epoch with one echoed
 character, slow the proxy to 400 ms each way, then assert the next character

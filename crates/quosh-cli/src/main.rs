@@ -201,6 +201,7 @@ async fn client(ssh: &str, target: &str, predict: PredictMode) -> Result<()> {
         .to_string();
     let (port, hash, session_id, token) = parse_connect_line(&line)?;
     let host = ssh_hostname(ssh, target).await?;
+    let title = format!("quosh: {target}");
     run_session(
         &host,
         port,
@@ -210,6 +211,7 @@ async fn client(ssh: &str, target: &str, predict: PredictMode) -> Result<()> {
         cols,
         rows,
         predict == PredictMode::Never,
+        &title,
     )
     .await
 }
@@ -610,6 +612,10 @@ struct Render {
     outage: Option<Duration>,
     /// The banner text currently on screen, so an unchanged one is not redrawn.
     shown_banner: Option<String>,
+    /// Base terminal title; the `(offline)` suffix is added while `outage` is
+    /// set. `shown_title` avoids re-emitting an unchanged one.
+    title: Option<String>,
+    shown_title: Option<String>,
     start: Instant,
 }
 
@@ -627,6 +633,8 @@ impl Render {
             display: None,
             outage: None,
             shown_banner: None,
+            title: None,
+            shown_title: None,
             start: Instant::now(),
         }
     }
@@ -711,6 +719,8 @@ impl Render {
     }
 
     fn repaint(&mut self) -> io::Result<()> {
+        // The tab title tracks connection state even before the first frame.
+        self.paint_title()?;
         let Some(screen) = self.screen.as_ref() else {
             return Ok(());
         };
@@ -745,6 +755,26 @@ impl Render {
         }
         Ok(())
     }
+
+    /// Set the base tab title (`quosh: user@host`). Painted immediately and
+    /// kept in sync with the outage banner on later repaints.
+    fn set_title(&mut self, title: String) -> io::Result<()> {
+        self.title = Some(title);
+        self.paint_title()
+    }
+
+    fn paint_title(&mut self) -> io::Result<()> {
+        let Some(base) = self.title.as_ref() else {
+            return Ok(());
+        };
+        let desired = title_for(base, self.outage);
+        if self.shown_title.as_deref() == Some(desired.as_str()) {
+            return Ok(());
+        }
+        emit_title(&desired)?;
+        self.shown_title = Some(desired);
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -757,6 +787,7 @@ async fn run_session(
     mut cols: u16,
     mut rows: u16,
     never: bool,
+    title: &str,
 ) -> Result<()> {
     let url = wt_url(host, port)?;
     eprintln!("quosh: connecting to {url} (UDP {port})");
@@ -765,6 +796,10 @@ async fn run_session(
     let mut seq: u64 = 0;
     let mut unacked: Vec<(u64, Vec<u8>)> = Vec::new();
     let mut render = Render::new(never);
+    // Push the shell's title so it can be restored on exit, then label the
+    // tab with something shorter and more useful than the full command line.
+    push_title()?;
+    render.set_title(title.to_string())?;
     let mut hungup = false;
     let mut exit_code = 0i32;
 
@@ -897,6 +932,7 @@ async fn run_session(
         }
     };
     drop(raw);
+    let _ = pop_title();
     result?;
     if exit_code != 0 {
         std::process::exit(exit_code);
@@ -1269,6 +1305,47 @@ fn paint_frame(frame: &FrameState, show_cursor: bool) -> io::Result<()> {
     out.flush()
 }
 
+/// OSC 2 sets the terminal window/tab title; BEL terminates it. A no-op when
+/// stdout is not a terminal.
+fn emit_title(title: &str) -> io::Result<()> {
+    if !io::stdout().is_terminal() {
+        return Ok(());
+    }
+    let mut out = io::stdout();
+    write!(out, "\x1b]2;{title}\x07")?;
+    out.flush()
+}
+
+/// xterm title stack, so quosh restores whatever the shell had set. Terminals
+/// without support ignore both sequences.
+fn push_title() -> io::Result<()> {
+    if !io::stdout().is_terminal() {
+        return Ok(());
+    }
+    let mut out = io::stdout();
+    out.write_all(b"\x1b[22;0t")?;
+    out.flush()
+}
+
+fn pop_title() -> io::Result<()> {
+    if !io::stdout().is_terminal() {
+        return Ok(());
+    }
+    let mut out = io::stdout();
+    out.write_all(b"\x1b[23;0t")?;
+    out.flush()
+}
+
+/// What the tab should read. The `(offline)` suffix keeps the tab honest
+/// during a reconnect, when the screen is otherwise frozen.
+fn title_for(base: &str, outage: Option<Duration>) -> String {
+    if outage.is_some() {
+        format!("{base} (offline)")
+    } else {
+        base.to_string()
+    }
+}
+
 fn banner_line(elapsed: Duration) -> String {
     format!(
         " quosh: {} seconds without network  [Ctrl-^ . to quit] ",
@@ -1403,6 +1480,15 @@ mod tests {
         assert!(
             !writer.send(chunk),
             "overflow must be reported, not dropped"
+        );
+    }
+
+    #[test]
+    fn title_tracks_the_outage() {
+        assert_eq!(title_for("quosh: a@b", None), "quosh: a@b");
+        assert_eq!(
+            title_for("quosh: a@b", Some(Duration::from_secs(4))),
+            "quosh: a@b (offline)"
         );
     }
 

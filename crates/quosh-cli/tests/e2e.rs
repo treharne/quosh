@@ -301,7 +301,8 @@ impl CliPty {
                 Ok(n) => self.collected.extend_from_slice(&tmp[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => panic!("pty read: {e}"),
+                // The slave side is gone (EIO on Linux); nothing left to read.
+                Err(_) => break,
             }
         }
     }
@@ -822,4 +823,33 @@ async fn cli_detects_dead_path_before_quic_idle_timeout() {
     cli.wait_for(&mark, Duration::from_secs(8)).await;
     cli.write(b"exit\r");
     let _ = tokio::time::timeout(Duration::from_secs(8), cli.child.wait()).await;
+}
+
+/// The tab must be labelled with the ssh target, not the full command line,
+/// and the shell's previous title restored on exit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_sets_and_restores_the_tab_title() {
+    let stack = Stack::start().await;
+    let mut cli = CliPty::spawn(&stack);
+    let id = wait_session(&stack, Duration::from_secs(8)).await;
+    wait_attached(&stack, id, Duration::from_secs(8)).await;
+
+    let titled = cli
+        .wait_until(Duration::from_secs(5), |o| {
+            o.contains("\x1b]2;quosh: quoshtest@127.0.0.1")
+        })
+        .await;
+    assert!(titled, "no useful tab title; out:\n{}", cli.output());
+    assert!(
+        cli.output().contains("\x1b[22;0t"),
+        "title stack was not pushed"
+    );
+
+    cli.write(b"exit\r");
+    let _ = tokio::time::timeout(Duration::from_secs(8), cli.child.wait()).await;
+    cli.pump();
+    assert!(
+        cli.output().contains("\x1b[23;0t"),
+        "title stack was not popped on exit"
+    );
 }
