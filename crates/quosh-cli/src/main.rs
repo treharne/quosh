@@ -190,8 +190,43 @@ async fn client(ssh: &str, target: &str) -> Result<()> {
         .context("no QUOSH CONNECT line from server (is quosh-server running?)")?
         .to_string();
     let (port, hash, session_id, token) = parse_connect_line(&line)?;
-    let host = target.rsplit('@').next().context("host")?;
-    run_session(host, port, hash, session_id, token, cols, rows).await
+    let host = ssh_hostname(ssh, target).await?;
+    run_session(&host, port, hash, session_id, token, cols, rows).await
+}
+
+/// Use OpenSSH's evaluated `HostName` so `Host agents` / Tailscale aliases
+/// match the SSH hop. Falling back to the name after `@` is wrong when that
+/// alias only exists in `~/.ssh/config`.
+async fn ssh_hostname(ssh: &str, target: &str) -> Result<String> {
+    let fallback = target
+        .rsplit('@')
+        .next()
+        .context("host")?
+        .to_string();
+    let mut parts: Vec<String> = ssh.split_whitespace().map(str::to_string).collect();
+    if parts.is_empty() {
+        return Ok(fallback);
+    }
+    parts.push("-G".into());
+    parts.push(target.to_string());
+    let mut cmd = Command::new(&parts[0]);
+    cmd.args(&parts[1..]);
+    let Ok(out) = cmd.output().await else {
+        return Ok(fallback);
+    };
+    if !out.status.success() {
+        return Ok(fallback);
+    }
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut words = line.split_whitespace();
+        if words.next() == Some("hostname")
+            && let Some(h) = words.next()
+            && !h.is_empty()
+        {
+            return Ok(h.to_string());
+        }
+    }
+    Ok(fallback)
 }
 
 async fn ssh_helper(ssh: &str, target: &str, rest: &[&str]) -> Result<String> {
@@ -317,7 +352,8 @@ async fn run_session(
     mut rows: u16,
 ) -> Result<()> {
     let url = wt_url(host, port)?;
-    let raw = RawMode::enter()?;
+    eprintln!("quosh: connecting to {url}");
+    let mut raw: Option<RawMode> = None;
     let mut last_ok = Instant::now();
     let mut seq: u64 = 0;
     let mut unacked: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -332,7 +368,6 @@ async fn run_session(
             tokio::spawn(input_task(bytes_tx, ctrl_tx, tty));
         }
         Err(e) => {
-            drop(raw);
             bail!("open /dev/tty for input: {e}");
         }
     }
@@ -348,6 +383,9 @@ async fn run_session(
                 match c {
                     Ok(conn) => {
                         last_ok = Instant::now();
+                        if raw.is_none() {
+                            raw = Some(RawMode::enter()?);
+                        }
                         if showing_outage {
                             if let Some(s) = screen.as_ref() {
                                 let _ = paint(s, true);
@@ -379,18 +417,16 @@ async fn run_session(
                             Err(e) => {
                                 let io_kind = e.downcast_ref::<io::Error>().map(|ie| ie.kind());
                                 if io_kind != Some(io::ErrorKind::WouldBlock) {
-                                    let msg = format!("{e:#}");
-                                    if msg.contains("unknown session") {
-                                        break Ok(());
-                                    }
-                                    eprintln!("\r\nquosh: {msg}");
+                                    eprintln!("\r\nquosh: {e:#}");
                                 }
                             }
                         }
                         connect_fut = start_connect(url.clone(), hash, false);
                     }
-                    Err(_) => {
-                        if last_ok.elapsed() > Duration::from_secs(OUTAGE_BANNER_SECS) {
+                    Err(e) => {
+                        if raw.is_none() {
+                            eprintln!("quosh: connect failed: {e:#}");
+                        } else if last_ok.elapsed() > Duration::from_secs(OUTAGE_BANNER_SECS) {
                             let _ = paint_banner(last_ok.elapsed(), screen.as_ref());
                             showing_outage = true;
                         }
@@ -569,10 +605,6 @@ async fn session_loop(
                 }
                 MSG_ERROR => {
                     let (c, m) = decode_error(&payload)?;
-                    if c == 2 {
-                        *hungup = true;
-                        return Ok(true);
-                    }
                     bail!("server error {c}: {m}");
                 }
                 _ => {}
