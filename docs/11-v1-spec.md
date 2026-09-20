@@ -176,4 +176,10 @@ Conservative prediction is not a confidentiality guarantee: the epoch gate preve
 
 ## PWA (slice 3, not built now)
 
-Passkeys at RP `quosh.jtcs.dev`, verified on the user server, scoped to the Unix user who ran `quosh enrol`. Same WebTransport endpoint and protocol as the CLI.
+Static app at `https://quosh.jtcs.dev`, passkeys at RP `quosh.jtcs.dev`, same
+WebTransport endpoint and protocol as the CLI. After one SSH-assisted
+enrolment the browser reconnects without SSH: the passkey authenticates the
+user and a pinned certificate chain authenticates the server (no user domain
+or public CA). WebAuthn identity is `<unix_user>@<server_address>` so one
+passkey manager can hold credentials for several servers. Full design:
+[13-browser-auth-and-trust.md](13-browser-auth-and-trust.md).

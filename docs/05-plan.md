@@ -12,7 +12,7 @@ Implemented: shared `quosh-predict` crate (adaptive/never), `echo_ack` in the QS
 
 ## Slice 3 — PWA
 
-Static app at `https://quosh.jtcs.dev`. SSH `quosh enrol` prints the authenticated link. Passkeys bound to the enrol uid. Same WebTransport endpoint. Unmodified blit-browser only if it can consume our frames without patches.
+Static app at `https://quosh.jtcs.dev`. SSH `quosh enrol` prints the authenticated link. Passkeys bound to the enrol uid, with WebAuthn identity `<unix_user>@<server_address>`. Reconnect without SSH via a pinned certificate chain of 7 × ≤14-day certs (~98 days), topped up per connection to 98 days from the last connect. Same WebTransport endpoint. Unmodified blit-browser only if it can consume our frames without patches. Design: [13-browser-auth-and-trust.md](13-browser-auth-and-trust.md).
 
 ## Later
 
