@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use quosh_server::cert;
+use quosh_server::cert::{self, CertChain};
 use quosh_server::helper::{self, Daemon};
 use quosh_server::transport::handle_incoming;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
-use wtransport::{Endpoint, Identity, ServerConfig};
+use wtransport::{Endpoint, ServerConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "quosh-server")]
@@ -21,6 +21,9 @@ struct Args {
     /// State directory (TLS material).
     #[arg(long, default_value = "/var/lib/quosh")]
     data_dir: PathBuf,
+    /// Number of certificates in the rotation window.
+    #[arg(long, default_value_t = cert::DEFAULT_CHAIN)]
+    cert_chain: usize,
 }
 
 #[tokio::main]
@@ -46,17 +49,13 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&args.data_dir)?;
     let _ = std::fs::remove_file(&args.socket);
 
-    let tls = cert::load_or_generate(&args.data_dir.join("tls"))?;
-    info!("cert sha256 {}", hex::encode(tls.sha256));
-
-    let identity = Identity::load_pemfiles(&tls.cert_pem, &tls.key_pem)
-        .await
-        .context("load TLS identity")?;
+    let chain = CertChain::load(&args.data_dir.join("tls"), args.cert_chain)?;
+    info!("cert sha256 {}", hex::encode(chain.current_hash()?));
 
     let bind: std::net::SocketAddr = args.bind.parse().context("bind addr")?;
     let config = ServerConfig::builder()
         .with_bind_address(bind)
-        .with_identity(identity)
+        .with_custom_tls(chain.tls_config()?)
         .build();
 
     let endpoint = Endpoint::server(config).context("WebTransport endpoint")?;
@@ -72,7 +71,7 @@ async fn main() -> Result<()> {
 
     let daemon = Arc::new(Daemon {
         sessions: Arc::new(tokio::sync::Mutex::new(Default::default())),
-        cert_sha256: tls.sha256,
+        chain: chain.clone(),
         port,
     });
     let d2 = daemon.clone();

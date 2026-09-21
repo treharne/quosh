@@ -24,6 +24,14 @@ Unmodified blit-browser only if it can consume our frames without patches.
 Design: [13-browser-auth-and-trust.md](13-browser-auth-and-trust.md) and
 [14-libraries-and-reference-app.md](14-libraries-and-reference-app.md).
 
+Progress: `quosh-client` is extracted and the CLI runs on it
+([14](14-libraries-and-reference-app.md)). The server trust foundation —
+long-lived identity key, persisted 13-day/14-day certificate chain
+(`--cert-chain N`, default 7), and a rustls resolver that serves the current
+certificate without restarts — is implemented in
+`crates/quosh-server/src/cert.rs` ([13](13-browser-auth-and-trust.md)). Next:
+enrolment and passkey.
+
 ## Later
 
 Arbitrary remote commands; passkey CLI; server-local `quosh enrol`; system-hosted PWA; longer-lived identity without SSH; Herdr-on-Quosh; iOS/Android.

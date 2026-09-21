@@ -1,7 +1,8 @@
 # Browser authentication and server trust (slice 3)
 
-Status: agreed design, not implemented. Where this conflicts with the one-line
-PWA note in [v1 spec](11-v1-spec.md), this document wins.
+Status: agreed design. The server trust foundation is implemented (see
+"Certificate chain" below); enrolment and passkey are not. Where this conflicts
+with the one-line PWA note in [v1 spec](11-v1-spec.md), this document wins.
 
 ## Goal
 
@@ -235,6 +236,18 @@ durable, so a lost device stays authorized until its registration is removed.
   default) from now.
 - If a browser has been offline longer than its cached coverage, it needs the
   saved enrol link or SSH. With the default 7 certificates this is ≈92 days.
+
+Implemented in `crates/quosh-server/src/cert.rs`. The identity key and the
+DER of every generated certificate are persisted under `<data-dir>/tls/`
+(`identity.pem` mode 0600, `chain-anchor`, `cert-<epoch>.der`); certificate
+bytes are never regenerated because ECDSA signatures are randomised and a
+regenerated certificate would change its hash. `CertChain::tls_config` builds a
+rustls `ServerConfig` with a `ResolvesServerCert` that serves the certificate
+for the current epoch, so the endpoint rotates without a restart. The chain is
+pre-generated for the current window at startup and topped up lazily on the
+first handshake of a new epoch; expired epochs are pruned. `forward_hashes()`
+exposes the current-plus-forward hashes for the enrolment handshake. A legacy
+`key.pem` from the pre-chain server is adopted as the identity key on upgrade.
 
 ## Client storage and secrets
 

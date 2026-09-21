@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use web_transport_quinn::{RecvStream, SendStream, Session as WtSession};
-use wtransport::{Endpoint, Identity, ServerConfig};
+use wtransport::{Endpoint, ServerConfig};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
@@ -141,13 +141,11 @@ impl Harness {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("tls dir");
-        let tls = crate::cert::load_or_generate(&dir).expect("tls");
-        let identity = Identity::load_pemfiles(&tls.cert_pem, &tls.key_pem)
-            .await
-            .expect("identity");
+        let tls = crate::cert::CertChain::load(&dir, 3).expect("tls");
+        let hash = tls.current_hash().expect("cert hash");
         let config = ServerConfig::builder()
             .with_bind_address("127.0.0.1:0".parse().unwrap())
-            .with_identity(identity)
+            .with_custom_tls(tls.tls_config().expect("tls config"))
             .build();
         let endpoint = Endpoint::server(config).expect("endpoint");
         let backend = endpoint.local_addr().expect("local_addr");
@@ -170,7 +168,7 @@ impl Harness {
         });
         Self {
             sessions,
-            hash: tls.sha256,
+            hash,
             proxy,
             dir,
             accept,

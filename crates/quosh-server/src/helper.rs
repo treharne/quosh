@@ -1,3 +1,4 @@
+use crate::cert::CertChain;
 use crate::session::{Session, spawn_pair};
 use anyhow::Result;
 use quosh_proto::{HelperRequest, HelperResponse, IDLE_SECS, IdleInfo, validate_dims};
@@ -19,7 +20,7 @@ const MAX_PER_UID: usize = 32;
 #[derive(Clone)]
 pub struct Daemon {
     pub sessions: Registry,
-    pub cert_sha256: [u8; 32],
+    pub chain: Arc<CertChain>,
     pub port: u16,
 }
 
@@ -58,18 +59,22 @@ impl Daemon {
     }
 
     async fn dispatch(&self, uid: u32, req: HelperRequest) -> HelperResponse {
+        let cert = match self.chain.current_hash() {
+            Ok(h) => hex::encode(h),
+            Err(e) => return fail(format!("certificate: {e:#}")),
+        };
         match req.op.as_str() {
-            "idle" => self.list_idle(uid).await,
+            "idle" => self.list_idle(uid, cert).await,
             "ping" => HelperResponse {
                 ok: true,
                 error: None,
                 session_id: None,
                 token: None,
                 port: Some(self.port),
-                cert_sha256: Some(hex::encode(self.cert_sha256)),
+                cert_sha256: Some(cert),
                 idle: vec![],
             },
-            "create" => self.create(uid, req).await,
+            "create" => self.create(uid, req, cert).await,
             other => fail(format!("unknown op {other}")),
         }
     }
@@ -93,19 +98,19 @@ impl Daemon {
         idle
     }
 
-    async fn list_idle(&self, uid: u32) -> HelperResponse {
+    async fn list_idle(&self, uid: u32, cert: String) -> HelperResponse {
         HelperResponse {
             ok: true,
             error: None,
             session_id: None,
             token: None,
             port: Some(self.port),
-            cert_sha256: Some(hex::encode(self.cert_sha256)),
+            cert_sha256: Some(cert),
             idle: self.collect_idle(uid).await,
         }
     }
 
-    async fn create(&self, uid: u32, req: HelperRequest) -> HelperResponse {
+    async fn create(&self, uid: u32, req: HelperRequest, cert: String) -> HelperResponse {
         let cols = if req.cols == 0 { 80 } else { req.cols };
         let rows = if req.rows == 0 { 24 } else { req.rows };
         if let Err(e) = validate_dims(cols, rows) {
@@ -159,7 +164,7 @@ impl Daemon {
                     session_id: Some(hex::encode(id)),
                     token: Some(hex::encode(token)),
                     port: Some(self.port),
-                    cert_sha256: Some(hex::encode(self.cert_sha256)),
+                    cert_sha256: Some(cert),
                     idle,
                 }
             }
@@ -230,9 +235,15 @@ mod tests {
     use tokio::net::UnixStream as TokioUnix;
 
     fn test_daemon() -> Daemon {
+        let dir = std::env::temp_dir().join(format!(
+            "quosh-helper-{}-{}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let chain = CertChain::load(&dir, 1).expect("chain");
         Daemon {
             sessions: Arc::new(Mutex::new(Default::default())),
-            cert_sha256: [9; 32],
+            chain,
             port: 7,
         }
     }
@@ -286,7 +297,10 @@ mod tests {
         let d2 = daemon.clone();
         let r1 = req.clone();
         let r2 = req;
-        let (a, b) = tokio::join!(d1.create(uid, r1), d2.create(uid, r2));
+        let (a, b) = tokio::join!(
+            d1.create(uid, r1, String::new()),
+            d2.create(uid, r2, String::new())
+        );
         let oks = [a.ok, b.ok].into_iter().filter(|x| *x).count();
         assert_eq!(
             oks, 1,
@@ -328,6 +342,7 @@ mod tests {
                     rows: 24,
                     kill_idle: true,
                 },
+                String::new(),
             )
             .await;
         assert!(resp.ok, "idle cleanup should free a slot: {:?}", resp.error);

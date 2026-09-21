@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::net::{UdpSocket, UnixListener};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
-use wtransport::{Endpoint, Identity, ServerConfig};
+use wtransport::{Endpoint, ServerConfig};
 
 fn install_crypto() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -144,13 +144,10 @@ impl Stack {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
-        let tls = quosh_server::cert::load_or_generate(&dir.join("tls")).expect("tls");
-        let identity = Identity::load_pemfiles(&tls.cert_pem, &tls.key_pem)
-            .await
-            .expect("identity");
+        let chain = quosh_server::cert::CertChain::load(&dir.join("tls"), 3).expect("tls");
         let config = ServerConfig::builder()
             .with_bind_address("127.0.0.1:0".parse().unwrap())
-            .with_identity(identity)
+            .with_custom_tls(chain.tls_config().expect("tls config"))
             .build();
         let endpoint = Endpoint::server(config).expect("endpoint");
         let backend = endpoint.local_addr().expect("addr");
@@ -165,7 +162,7 @@ impl Stack {
             Arc::new(tokio::sync::Mutex::new(Default::default()));
         let daemon = Arc::new(Daemon {
             sessions: sessions.clone(),
-            cert_sha256: tls.sha256,
+            chain,
             port: proxy.addr.port(),
         });
         let helper = tokio::spawn({
