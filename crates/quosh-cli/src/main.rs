@@ -1,13 +1,10 @@
 use anyhow::{Context, Result, bail};
 use blit_remote::FrameState;
 use clap::{Parser, Subcommand};
-use quosh_predict::{DisplayPreference, Predictor};
+use quosh_client::{Client, ClientError, Tick};
 use quosh_proto::{
-    CONNECT_PREFIX, DEFAULT_PORT, FrameFeed, Hello, HelloOk, HelperRequest, HelperResponse,
-    MODE_BRACKETED_PASTE, MODE_CURSOR_VISIBLE, MSG_ERROR, MSG_EXIT, MSG_HELLO_OK, MSG_INPUT_ACK,
-    MSG_PONG, MSG_SCREEN, OUTAGE_BANNER_SECS, PROTOCOL_VERSION, Screen, WT_PATH, decode_error,
-    decode_exit, decode_u64, encode_ack_state, encode_hangup, encode_input, encode_ping,
-    encode_resize, frame_ansi, parse_connect_line, split_frame,
+    CONNECT_PREFIX, DEFAULT_PORT, HelperRequest, HelperResponse, MODE_BRACKETED_PASTE,
+    MODE_CURSOR_VISIBLE, WT_PATH, frame_ansi, parse_connect_line,
 };
 use std::collections::VecDeque;
 use std::fs::File;
@@ -298,8 +295,6 @@ enum LinkEnd {
     HandshakeFailed,
 }
 
-const UNACKED_CAP: usize = 256 * 1024;
-
 /// Dup stdin for the input thread. Do not `F_SETFL O_NONBLOCK`: on a tty that
 /// flag is OFD-wide and would make stdout paints fail with EAGAIN. macOS also
 /// does not deliver keystrokes to a second `open("/dev/tty")`.
@@ -540,8 +535,6 @@ async fn signal_task(ctrl: mpsc::Sender<CtrlEvent>) {
     }
 }
 
-const PASTE_BYTES: usize = 100;
-
 /// A condition that reconnecting cannot fix: server rejection, protocol
 /// mismatch, or an unknown/expired session. `run_session` stops on these.
 #[derive(Debug)]
@@ -573,27 +566,6 @@ fn input_overflowed() -> anyhow::Error {
     )
 }
 
-fn srtt_scaled(srtt_ms: Option<f64>, factor: f64) -> Duration {
-    srtt_ms
-        .map(|s| Duration::from_secs_f64((factor * s / 1000.0).min(20.0)))
-        .unwrap_or_default()
-}
-
-/// Re-probe when the outstanding probe goes unanswered. Clearing `ping_sent`
-/// only on pong meant a single lost pong stopped probing, so an idle link that
-/// recovered never woke up.
-fn ping_retry(srtt_ms: Option<f64>) -> Duration {
-    Duration::from_secs(2).max(srtt_scaled(srtt_ms, 2.0))
-}
-
-/// Declare the path dead when nothing at all has arrived for this long. QUIC
-/// only gives up after its ~30 s idle timeout, which makes an IP/VPN change
-/// look like a hang instead of a reconnect. Scaled for high-RTT links.
-fn link_dead(srtt_ms: Option<f64>) -> Duration {
-    Duration::from_secs(8).max(srtt_scaled(srtt_ms, 4.0))
-}
-
-/// A handshake that never completes. Used only after transport failures repeat,
 /// so a transient network interruption during attach is retried first.
 fn handshake_failed(reason: impl std::fmt::Display) -> anyhow::Error {
     fatal(format!(
@@ -604,170 +576,60 @@ fn handshake_failed(reason: impl std::fmt::Display) -> anyhow::Error {
 
 /// Owns the confirmed screen, the predictor, and the last displayed frame.
 /// Every repaint starts from confirmed state and reapplies predictions.
-struct Render {
-    predictor: Predictor,
-    screen: Option<Screen>,
-    display: Option<FrameState>,
-    /// When `Some`, the outage banner is drawn over the frame on every repaint.
-    outage: Option<Duration>,
-    /// The banner text currently on screen, so an unchanged one is not redrawn.
+/// Paints the client's display frame and outage banner to the terminal.
+///
+/// All protocol and prediction state lives in [`Client`]; the painter only
+/// remembers what was last drawn so redundant writes are skipped.
+struct Painter {
+    title: String,
+    shown_frame: Option<FrameState>,
     shown_banner: Option<String>,
-    /// Base terminal title; the `(offline)` suffix is added while `outage` is
-    /// set. `shown_title` avoids re-emitting an unchanged one.
-    title: Option<String>,
     shown_title: Option<String>,
-    start: Instant,
 }
 
-impl Render {
-    fn new(never: bool) -> Self {
-        let mut predictor = Predictor::new();
-        predictor.set_display_preference(if never {
-            DisplayPreference::Never
-        } else {
-            DisplayPreference::Adaptive
-        });
+impl Painter {
+    fn new(title: String) -> Self {
         Self {
-            predictor,
-            screen: None,
-            display: None,
-            outage: None,
+            title,
+            shown_frame: None,
             shown_banner: None,
-            title: None,
             shown_title: None,
-            start: Instant::now(),
         }
     }
 
-    fn now(&self) -> u64 {
-        self.start.elapsed().as_millis() as u64
+    /// Forget what was drawn so the next paint writes everything, e.g. after a
+    /// reconnect.
+    fn force_repaint(&mut self) {
+        self.shown_frame = None;
+        self.shown_banner = None;
     }
 
-    /// Mosh's `send_interval`: `clamp(ceil(SRTT / 2), 20, 250)` ms.
-    fn set_rtt_ms(&mut self, srtt_ms: f64) {
-        let interval = ((srtt_ms / 2.0).ceil() as u32).clamp(20, 250);
-        self.predictor.set_send_interval(interval);
-    }
-
-    fn reset(&mut self) {
-        self.predictor.reset();
-        self.display = None;
-    }
-
-    fn tick_delay(&self) -> Option<Duration> {
-        if self.predictor.active() {
-            Some(Duration::from_millis(50))
-        } else {
-            None
-        }
-    }
-
-    /// Install a screen atomically: frame, echo checkpoint, cull, repaint.
-    /// Returns `(version, mode)` when the screen was newer.
-    fn apply_screen(&mut self, incoming: Screen) -> io::Result<Option<(u64, u16)>> {
-        let Some(applied) = Screen::apply_newer(self.screen.as_ref(), incoming) else {
-            return Ok(None);
-        };
-        let now = self.now();
-        let version = applied.version;
-        let mode = applied.frame.mode();
-        self.predictor.set_local_frame_late_acked(applied.echo_ack);
-        self.predictor.cull(&applied.frame, now);
-        self.screen = Some(applied);
-        // A frame arriving means connectivity is back; drop the banner.
-        self.outage = None;
-        self.repaint()?;
-        Ok(Some((version, mode)))
-    }
-
-    /// Feed the bytes of one input message. All bytes share `seq` (the
-    /// message's frame), and bulk reads are not predicted.
-    ///
-    /// The predictor expires a prediction at `local_frame_sent + 1` (Mosh's
-    /// convention), so message `seq` is fed as `seq - 1` to expire at `seq`,
-    /// matching the server's echo checkpoint exactly.
-    fn predict(&mut self, seq: u64, bytes: &[u8]) -> io::Result<()> {
-        if bytes.len() > PASTE_BYTES {
-            // Bulk input is not predicted. Repaint immediately so any existing
-            // overlay is removed instead of lingering until the next frame.
-            self.predictor.reset();
-            return self.repaint();
-        }
-        let Some(screen) = self.screen.as_ref() else {
+    fn paint(&mut self, client: &Client) -> io::Result<()> {
+        let banner = client.outage().map(banner_line);
+        self.paint_title(client.outage())?;
+        let Some(frame) = client.display() else {
             return Ok(());
         };
-        self.predictor.set_local_frame_sent(seq.saturating_sub(1));
-        let now = self.start.elapsed().as_millis() as u64;
-        for &b in bytes {
-            let basis = self.display.as_ref().unwrap_or(&screen.frame);
-            self.predictor.new_user_byte(b, basis, now);
-        }
-        self.repaint()
-    }
-
-    /// Time-based reconciliation: a prediction pending on a quiet link still
-    /// has to reach the glitch threshold and be redrawn.
-    fn tick(&mut self) -> io::Result<()> {
-        if !self.predictor.active() {
-            return Ok(());
-        }
-        if let Some(screen) = self.screen.as_ref() {
-            let now = self.now();
-            self.predictor.cull(&screen.frame, now);
-        }
-        self.repaint()
-    }
-
-    fn repaint(&mut self) -> io::Result<()> {
-        // The tab title tracks connection state even before the first frame.
-        self.paint_title()?;
-        let Some(screen) = self.screen.as_ref() else {
-            return Ok(());
-        };
-        let mut frame = screen.frame.clone();
-        self.predictor.apply(&mut frame);
-        let banner = self.outage.map(banner_line);
         // Predictions are always generated, but on a fast link `apply` leaves
         // the frame unchanged. Skip the write so timer ticks are silent, unless
         // the banner text changed (including appearing or clearing).
-        if self.display.as_ref() == Some(&frame) && self.shown_banner == banner {
+        if self.shown_frame.as_ref() == Some(frame) && self.shown_banner == banner {
             return Ok(());
         }
         let rows = frame.rows();
-        paint_frame(&frame, banner.is_none())?;
+        paint_frame(frame, banner.is_none())?;
         if let Some(line) = &banner {
             write_banner(rows, line)?;
         }
-        self.display = Some(frame);
+        self.shown_frame = Some(frame.clone());
         self.shown_banner = banner;
         Ok(())
     }
 
-    /// Show (or update) the outage banner. It stays until [`clear_outage`].
-    fn set_outage(&mut self, elapsed: Duration) -> io::Result<()> {
-        self.outage = Some(elapsed);
-        self.repaint()
-    }
-
-    fn clear_outage(&mut self) -> io::Result<()> {
-        if self.outage.take().is_some() {
-            self.repaint()?;
-        }
-        Ok(())
-    }
-
-    /// Set the base tab title (`quosh: user@host`). Painted immediately and
-    /// kept in sync with the outage banner on later repaints.
-    fn set_title(&mut self, title: String) -> io::Result<()> {
-        self.title = Some(title);
-        self.paint_title()
-    }
-
-    fn paint_title(&mut self) -> io::Result<()> {
-        let Some(base) = self.title.as_ref() else {
-            return Ok(());
-        };
-        let desired = title_for(base, self.outage);
+    /// Set the base tab title (`quosh: user@host`). Kept in sync with the
+    /// outage banner on later paints.
+    fn paint_title(&mut self, outage: Option<Duration>) -> io::Result<()> {
+        let desired = title_for(&self.title, outage);
         if self.shown_title.as_deref() == Some(desired.as_str()) {
             return Ok(());
         }
@@ -776,7 +638,6 @@ impl Render {
         Ok(())
     }
 }
-
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
     host: &str,
@@ -784,24 +645,22 @@ async fn run_session(
     hash: [u8; 32],
     session_id: [u8; 16],
     token: [u8; 32],
-    mut cols: u16,
-    mut rows: u16,
+    cols: u16,
+    rows: u16,
     never: bool,
     title: &str,
 ) -> Result<()> {
     let url = wt_url(host, port)?;
     eprintln!("quosh: connecting to {url} (UDP {port})");
-    let mut raw: Option<RawMode> = None;
-    let mut last_ok = Instant::now();
-    let mut seq: u64 = 0;
-    let mut unacked: Vec<(u64, Vec<u8>)> = Vec::new();
-    let mut render = Render::new(never);
+    let start = Instant::now();
+    let now = || start.elapsed().as_millis() as u64;
+    let mut client = Client::new(session_id, token, cols, rows, never);
+    let mut painter = Painter::new(title.to_string());
     // Push the shell's title so it can be restored on exit, then label the
     // tab with something shorter and more useful than the full command line.
     push_title()?;
-    render.set_title(title.to_string())?;
-    let mut hungup = false;
-    let mut exit_code = 0i32;
+    painter.paint_title(None)?;
+    let mut raw: Option<RawMode> = None;
 
     let (bytes_tx, mut bytes_rx) = mpsc::channel::<Vec<u8>>(8);
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<CtrlEvent>(8);
@@ -818,37 +677,24 @@ async fn run_session(
     let mut connect_fut = start_connect(url.clone(), hash, false);
     let mut handshake_failures = 0u32;
     let result: Result<()> = loop {
-        if hungup {
+        if client.is_hungup() {
             break Ok(());
         }
-        let tick = render.tick_delay();
+        let tick = client.tick_delay_ms();
         tokio::select! {
             c = &mut connect_fut => {
                 match c {
                     Ok(conn) => {
-                        last_ok = Instant::now();
                         if raw.is_none() {
                             raw = Some(RawMode::enter()?);
                         }
-                        // Restore the current confirmed frame (no banner, no
-                        // predictions) before resuming, e.g. after a reconnect.
-                        render.clear_outage()?;
                         match session_loop(
                             conn,
-                            session_id,
-                            token,
-                            &mut Live {
-                                cols: &mut cols,
-                                rows: &mut rows,
-                                seq: &mut seq,
-                                unacked: &mut unacked,
-                                last_ok: &mut last_ok,
-                                hungup: &mut hungup,
-                                exit_code: &mut exit_code,
-                                bytes_rx: &mut bytes_rx,
-                                ctrl_rx: &mut ctrl_rx,
-                            },
-                            &mut render,
+                            &mut client,
+                            &mut painter,
+                            &mut bytes_rx,
+                            &mut ctrl_rx,
+                            start,
                         )
                         .await
                         {
@@ -877,14 +723,16 @@ async fn run_session(
                                 }
                             }
                         }
-                        render.reset();
+                        client.reset();
+                        painter.force_repaint();
                         connect_fut = start_connect(url.clone(), hash, false);
                     }
                     Err(e) => {
                         if raw.is_none() {
                             eprintln!("quosh: connect failed: {e:#}");
-                        } else if last_ok.elapsed() > Duration::from_secs(OUTAGE_BANNER_SECS) {
-                            let _ = render.set_outage(last_ok.elapsed());
+                        } else {
+                            client.tick(now());
+                            painter.paint(&client)?;
                         }
                         connect_fut = start_connect(url.clone(), hash, true);
                     }
@@ -895,51 +743,47 @@ async fn run_session(
                     None => break Err(anyhow::anyhow!("input task exited")),
                     Some(CtrlEvent::Failed(m)) => break Err(anyhow::anyhow!("input: {m}")),
                     Some(CtrlEvent::Interrupt) | Some(CtrlEvent::Hangup) => {
-                        hungup = true;
+                        client.request_hangup();
                     }
                     Some(CtrlEvent::Overflow) => break Err(input_overflowed()),
                     Some(CtrlEvent::Eof) if raw.is_some() => {
-                        hungup = true;
+                        client.request_hangup();
                     }
                     Some(CtrlEvent::Eof) => {}
                     Some(CtrlEvent::Winch) => {
                         let (c, r) = tty_size();
-                        cols = c;
-                        rows = r;
+                        client.set_size(c, r);
                     }
                 }
             }
-            b = bytes_rx.recv(), if unacked_bytes(&unacked) < UNACKED_CAP => {
+            b = bytes_rx.recv(), if client.can_accept_input() => {
                 if let Some(b) = b {
-                    seq += 1;
-                    render.predict(seq, &b)?;
-                    unacked.push((seq, b));
+                    client.queue_input(b, now());
                 }
             }
             _ = async {
                 match tick {
-                    Some(d) => tokio::time::sleep(d).await,
+                    Some(d) => tokio::time::sleep(Duration::from_millis(d)).await,
                     None => std::future::pending::<()>().await,
                 }
             } => {
-                render.tick()?;
+                client.tick(now());
+                painter.paint(&client)?;
             }
             _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                if last_ok.elapsed() > Duration::from_secs(OUTAGE_BANNER_SECS) {
-                    let _ = render.set_outage(last_ok.elapsed());
-                }
+                client.tick(now());
+                painter.paint(&client)?;
             }
         }
     };
     drop(raw);
     let _ = pop_title();
     result?;
-    if exit_code != 0 {
-        std::process::exit(exit_code);
+    if client.exit_code() != 0 {
+        std::process::exit(client.exit_code());
     }
     Ok(())
 }
-
 fn wt_url(host: &str, port: u16) -> Result<Url> {
     let host = if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]")
@@ -973,290 +817,129 @@ async fn connect_once(url: &Url, hash: &[u8; 32]) -> Result<web_transport_quinn:
     Ok(session)
 }
 
-fn unacked_bytes(unacked: &[(u64, Vec<u8>)]) -> usize {
-    unacked.iter().map(|(_, d)| d.len()).sum()
-}
-
-fn pump_unacked(feed: &mut FrameFeed, unacked: &[(u64, Vec<u8>)], sent_seq: &mut u64) {
-    if feed.writing() {
-        return;
-    }
-    if let Some((seq, data)) = unacked.iter().find(|(s, _)| *s > *sent_seq)
-        && feed.push_ctrl(encode_input(*seq, data))
-    {
-        *sent_seq = *seq;
+/// Classify a clean stream close/EOF before `HelloOk` as a rejection.
+fn stream_end(client: &Client) -> Result<LinkEnd> {
+    if client.hello_ok() {
+        Ok(LinkEnd::Lost)
+    } else {
+        Err(handshake_closed())
     }
 }
 
-struct Live<'a> {
-    cols: &'a mut u16,
-    rows: &'a mut u16,
-    seq: &'a mut u64,
-    unacked: &'a mut Vec<(u64, Vec<u8>)>,
-    last_ok: &'a mut Instant,
-    hungup: &'a mut bool,
-    exit_code: &'a mut i32,
-    bytes_rx: &'a mut mpsc::Receiver<Vec<u8>>,
-    ctrl_rx: &'a mut mpsc::Receiver<CtrlEvent>,
+/// A transport failure is retryable even mid-attach.
+fn transport_error(client: &Client) -> Result<LinkEnd> {
+    if client.hello_ok() {
+        Ok(LinkEnd::Lost)
+    } else {
+        Ok(LinkEnd::HandshakeFailed)
+    }
+}
+
+/// `ClientError` is always fatal: a protocol violation or server rejection.
+fn client_fatal(e: ClientError) -> anyhow::Error {
+    let ClientError::Fatal(m) = e;
+    fatal(m)
 }
 
 async fn session_loop(
     conn: web_transport_quinn::Session,
-    session_id: [u8; 16],
-    token: [u8; 32],
-    live: &mut Live<'_>,
-    render: &mut Render,
+    client: &mut Client,
+    painter: &mut Painter,
+    bytes_rx: &mut mpsc::Receiver<Vec<u8>>,
+    ctrl_rx: &mut mpsc::Receiver<CtrlEvent>,
+    start: Instant,
 ) -> Result<LinkEnd> {
-    let cols = &mut *live.cols;
-    let rows = &mut *live.rows;
-    let seq = &mut *live.seq;
-    let unacked = &mut *live.unacked;
-    let last_ok = &mut *live.last_ok;
-    let hungup = &mut *live.hungup;
-    let exit_code = &mut *live.exit_code;
-    let bytes_rx = &mut *live.bytes_rx;
-    let ctrl_rx = &mut *live.ctrl_rx;
+    let now = || start.elapsed().as_millis() as u64;
     let (mut send, mut recv) = conn.open_bi().await.context("open control")?;
-    let mut feed = FrameFeed::default();
-    let _ = feed.push_ctrl(
-        Hello {
-            protocol: PROTOCOL_VERSION,
-            session_id,
-            token,
-            cols: *cols,
-            rows: *rows,
-        }
-        .encode(),
-    );
-
-    let mut sent_seq: u64 = 0;
-    let mut pending_ack: Option<u64> = None;
-    let mut buf = Vec::new();
     let mut tmp_recv = [0u8; 4096];
-    let mut ping = tokio::time::interval(Duration::from_secs(1));
-    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_mode: u16 = 0;
-    let mut srtt_ms: Option<f64> = None;
-    let mut ping_sent: Option<Instant> = None;
-    let mut hello_ok = false;
-
+    client.begin_connection(now());
+    painter.force_repaint();
     loop {
-        // Every frame parse failure is a protocol violation, not a transient
-        // network problem: retrying the same pair cannot help.
-        while let Some((typ, payload)) =
-            split_frame(&mut buf).map_err(|e| fatal(format!("protocol error: {e}")))?
-        {
-            match typ {
-                MSG_HELLO_OK => {
-                    let hello = HelloOk::decode(&payload)
-                        .map_err(|e| handshake_failed(format!("invalid HelloOk: {e}")))?;
-                    if hello.protocol != PROTOCOL_VERSION {
-                        return Err(fatal(format!(
-                            "server protocol {} != client {PROTOCOL_VERSION}; update the other side",
-                            hello.protocol
-                        )));
-                    }
-                    hello_ok = true;
-                }
-                MSG_SCREEN => {
-                    if let Ok(s) = Screen::decode_compressed(&payload) {
-                        *last_ok = Instant::now();
-                        if let Some((version, mode)) = render.apply_screen(s)? {
-                            pending_ack = Some(version);
-                            apply_modes(mode, &mut last_mode);
-                        }
-                    }
-                }
-                MSG_INPUT_ACK => {
-                    let ack =
-                        decode_u64(&payload).map_err(|e| fatal(format!("protocol error: {e}")))?;
-                    unacked.retain(|(s, _)| *s > ack);
-                }
-                MSG_PONG => {
-                    if let Some(t) = ping_sent.take() {
-                        let sample = t.elapsed().as_secs_f64() * 1000.0;
-                        let srtt = srtt_ms.map(|s| s * 0.75 + sample * 0.25).unwrap_or(sample);
-                        srtt_ms = Some(srtt);
-                        render.set_rtt_ms(srtt);
-                    }
-                    *last_ok = Instant::now();
-                    render.clear_outage()?;
-                }
-                MSG_EXIT => {
-                    let st =
-                        decode_exit(&payload).map_err(|e| fatal(format!("protocol error: {e}")))?;
-                    *exit_code = st;
-                    *hungup = true;
-                    return Ok(LinkEnd::Ended);
-                }
-                MSG_ERROR => {
-                    let (c, m) = decode_error(&payload)
-                        .map_err(|e| fatal(format!("protocol error: {e}")))?;
-                    return Err(fatal(format!("server error {c}: {m}")));
-                }
-                _ => {}
-            }
+        if client.tick(now()) == Tick::LinkDead {
+            return transport_error(client);
         }
-        if let Some(v) = pending_ack
-            && feed.push_ctrl(encode_ack_state(v))
-        {
-            pending_ack = None;
+        painter.paint(client)?;
+        if client.mode() != last_mode {
+            apply_modes(client.mode(), &mut last_mode);
         }
-        pump_unacked(&mut feed, unacked, &mut sent_seq);
-        let tick = render.tick_delay();
+        if client.is_hungup() {
+            return Ok(LinkEnd::Ended);
+        }
+        let next = client.tick_delay_ms().unwrap_or(1000).min(1000);
         tokio::select! {
             n = recv.read(&mut tmp_recv) => {
                 match n {
                     Ok(Some(n)) if n > 0 => {
-                        *last_ok = Instant::now();
-                        buf.extend_from_slice(&tmp_recv[..n]);
+                        if let Err(e) = client.recv_control(&tmp_recv[..n], now()) {
+                            return Err(client_fatal(e));
+                        }
                     }
-                    // Clean EOF (None or zero-length) before the handshake is
-                    // a rejection; after it, a transport loss to retry.
-                    Ok(_) => {
-                        return if hello_ok {
-                            Ok(LinkEnd::Lost)
-                        } else {
-                            Err(handshake_closed())
-                        };
-                    }
-                    // A read error is a transient transport failure even
-                    // mid-attach; retry it (bounded by the caller).
-                    Err(_) => {
-                        return if hello_ok {
-                            Ok(LinkEnd::Lost)
-                        } else {
-                            Ok(LinkEnd::HandshakeFailed)
-                        };
-                    }
+                    Ok(_) => return stream_end(client),
+                    Err(_) => return transport_error(client),
                 }
             }
             dg = conn.read_datagram() => {
                 match dg {
-                    Ok(bytes) => {
-                        *last_ok = Instant::now();
-                        if let Ok(s) = Screen::decode_compressed(&bytes)
-                            && let Some((version, mode)) = render.apply_screen(s)?
-                        {
-                            pending_ack = Some(version);
-                            apply_modes(mode, &mut last_mode);
-                        }
-                    }
-                    // A datagram error is a transient transport failure.
-                    Err(_) => {
-                        return if hello_ok {
-                            Ok(LinkEnd::Lost)
-                        } else {
-                            Ok(LinkEnd::HandshakeFailed)
-                        };
-                    }
+                    Ok(bytes) => client.recv_datagram(&bytes, now()),
+                    Err(_) => return transport_error(client),
                 }
             }
-            n = send.write(feed.rest()), if feed.writing() => {
+            n = send.write(client.outbound()), if client.writing() => {
                 match n {
-                    // A clean close before `HelloOk` is a rejection; after it,
-                    // a transport loss to retry.
-                    Ok(0) => {
-                        return if hello_ok {
-                            Ok(LinkEnd::Lost)
-                        } else {
-                            Err(handshake_closed())
-                        };
-                    }
-                    Ok(n) => feed.advance(n),
-                    // A write error is a transient transport failure.
-                    Err(_) => {
-                        return if hello_ok {
-                            Ok(LinkEnd::Lost)
-                        } else {
-                            Ok(LinkEnd::HandshakeFailed)
-                        };
-                    }
+                    Ok(0) => return stream_end(client),
+                    Ok(n) => client.advance_outbound(n),
+                    Err(_) => return transport_error(client),
                 }
             }
             ev = ctrl_rx.recv() => {
                 match ev {
-                    None | Some(CtrlEvent::Eof) | Some(CtrlEvent::Interrupt) | Some(CtrlEvent::Hangup) => {
-                        feed.push_fin(encode_hangup());
-                        *hungup = true;
-                        flush_bounded(&mut send, &mut feed, Duration::from_millis(400)).await;
+                    None
+                    | Some(CtrlEvent::Eof)
+                    | Some(CtrlEvent::Interrupt)
+                    | Some(CtrlEvent::Hangup) => {
+                        client.request_hangup();
+                        flush_bounded(&mut send, client, Duration::from_millis(400)).await;
                         return Ok(LinkEnd::Ended);
                     }
-                    Some(CtrlEvent::Failed(m)) => {
-                        bail!("input: {m}");
-                    }
+                    Some(CtrlEvent::Failed(m)) => bail!("input: {m}"),
                     Some(CtrlEvent::Overflow) => return Err(input_overflowed()),
                     Some(CtrlEvent::Winch) => {
                         let (c, r) = tty_size();
-                        *cols = c;
-                        *rows = r;
-                        let _ = feed.push_ctrl(encode_resize(c, r));
+                        client.set_size(c, r);
                     }
                 }
             }
-            b = bytes_rx.recv(), if unacked_bytes(unacked) < UNACKED_CAP => {
+            b = bytes_rx.recv(), if client.can_accept_input() => {
                 if let Some(b) = b {
-                    *seq += 1;
-                    render.predict(*seq, &b)?;
-                    unacked.push((*seq, b));
+                    client.queue_input(b, now());
                 }
             }
-            _ = async {
-                match tick {
-                    Some(d) => tokio::time::sleep(d).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => {
-                render.tick()?;
-            }
-            _ = ping.tick() => {
-                // One probe outstanding unless it goes unanswered; re-probing
-                // on a timeout keeps an idle link alive and lets a recovered
-                // path wake the connection back up.
-                let retry = ping_sent
-                    .map(|t| t.elapsed() >= ping_retry(srtt_ms))
-                    .unwrap_or(true);
-                if retry && feed.push_ctrl(encode_ping()) {
-                    ping_sent = Some(Instant::now());
-                }
-                // QUIC's idle timeout is ~30 s; a hard path change (new IP,
-                // VPN) must not take that long to become a reconnect.
-                if last_ok.elapsed() >= link_dead(srtt_ms) {
-                    return if hello_ok {
-                        Ok(LinkEnd::Lost)
-                    } else {
-                        Ok(LinkEnd::HandshakeFailed)
-                    };
-                }
-                if last_ok.elapsed() > Duration::from_secs(OUTAGE_BANNER_SECS) {
-                    let _ = render.set_outage(last_ok.elapsed());
-                }
-            }
+            _ = tokio::time::sleep(Duration::from_millis(next)) => {}
         }
     }
 }
 
-async fn flush_bounded<S>(send: &mut S, feed: &mut FrameFeed, limit: Duration)
+async fn flush_bounded<S>(send: &mut S, client: &mut Client, limit: Duration)
 where
     S: tokio::io::AsyncWriteExt + Unpin,
 {
     let deadline = tokio::time::Instant::now() + limit;
     loop {
-        feed.pump();
-        if !feed.writing() {
+        client.pump();
+        if !client.writing() {
             break;
         }
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
             break;
         }
-        match tokio::time::timeout(left, send.write(feed.rest())).await {
+        match tokio::time::timeout(left, send.write(client.outbound())).await {
             Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
-            Ok(Ok(n)) => feed.advance(n),
+            Ok(Ok(n)) => client.advance_outbound(n),
         }
     }
 }
-
 fn apply_modes(mode: u16, last: &mut u16) {
     let was_paste = *last & MODE_BRACKETED_PASTE != 0;
     let now_paste = mode & MODE_BRACKETED_PASTE != 0;

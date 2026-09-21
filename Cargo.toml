@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/quosh-proto", "crates/quosh-predict", "crates/quosh-server", "crates/quosh-cli"]
+members = ["crates/quosh-proto", "crates/quosh-predict", "crates/quosh-client", "crates/quosh-server", "crates/quosh-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ repository = "https://github.com/jt/quosh"
 [workspace.dependencies]
 quosh-proto = { path = "crates/quosh-proto" }
 quosh-predict = { path = "crates/quosh-predict" }
+quosh-client = { path = "crates/quosh-client" }
 anyhow = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }

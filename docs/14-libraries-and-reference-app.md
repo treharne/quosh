@@ -1,7 +1,8 @@
 # Libraries and the reference PWA
 
-Status: direction and decomposition agreed; not implemented. This sits
-alongside [13-browser-auth-and-trust.md](13-browser-auth-and-trust.md).
+Status: direction and decomposition agreed. `quosh-client` is extracted and
+the CLI runs on it; the browser libraries and the reference PWA are not built
+yet. This sits alongside [13-browser-auth-and-trust.md](13-browser-auth-and-trust.md).
 
 ## Direction
 
@@ -22,11 +23,12 @@ Rust crates:
 
 - `quosh-proto` (exists) — wire framing, message types, QS2 screen payload.
 - `quosh-predict` (exists) — Mosh-style prediction engine.
-- `quosh-client` (new) — transport-agnostic client state machine: Hello/HelloOk,
-  session id/token, input sequencing and unacked replay, ack handling,
-  epoch/reconnect logic, ping/pong RTT, outage timing, and feeding the
-  predictor. No I/O, no DOM, no tokio. This is what the CLI and the browser
-  share.
+- `quosh-client` (extracted; CLI runs on it) — transport-agnostic client state
+  machine: Hello/HelloOk, session id/token, input sequencing and unacked
+  replay, ack handling, epoch/reconnect logic, ping/pong RTT, outage timing,
+  prediction/cull, and the display frame. No I/O, no DOM, no tokio. The
+  adapter feeds it events plus monotonic milliseconds and drains its outbound
+  control bytes. This is what the CLI and the browser share.
 
 Browser-facing (npm workspace, separate packages):
 
@@ -57,9 +59,9 @@ The reference PWA composes the browser packages; the CLI composes the crates.
   (WebTransport, WebAuthn, Clipboard, DOM).
 - **Package granularity:** separate packages (`@quosh/proto`, `@quosh/predict`,
   `@quosh/client`, `@quosh/auth`, `@quosh/transport`, `@quosh/terminal`) rather
-  than one bundle, so consumers can take a subset.- **One state machine:** `quosh-client` is extracted and the CLI is refactored
-  onto it as part of slice 3, so the CLI and browser share the session,
-  reconnect, and prediction-feed logic.
+  than one bundle, so consumers can take a subset.- **One state machine:** `quosh-client` is extracted and the CLI runs on it,
+  so the CLI and browser share the session, reconnect, and prediction-feed
+  logic. Done.
 - **Distribution:** git/VCS dependencies for now; publish to npm and crates
   once the API stabilises.
 

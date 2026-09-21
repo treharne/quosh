@@ -1,0 +1,11 @@
+[package]
+name = "quosh-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+quosh-proto.workspace = true
+quosh-predict.workspace = true
+blit-remote.workspace = true
+thiserror.workspace = true
