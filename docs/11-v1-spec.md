@@ -182,5 +182,8 @@ WebTransport endpoint and protocol as the CLI. After one SSH-assisted
 enrolment the browser reconnects without SSH: the passkey authenticates the
 user and a pinned certificate chain authenticates the server (no user domain
 or public CA). WebAuthn identity is `<unix_user>@<server_address>` so one
-passkey manager can hold credentials for several servers. Full design:
-[13-browser-auth-and-trust.md](13-browser-auth-and-trust.md).
+passkey manager can hold credentials for several servers. The PWA is a
+**reference implementation**: the reusable pieces are separate libraries
+(`quosh-client` and the `@quosh/*` browser packages), and the CLI is refactored
+onto the same core. Full designs: [13-browser-auth-and-trust.md](13-browser-auth-and-trust.md)
+and [14-libraries-and-reference-app.md](14-libraries-and-reference-app.md).

@@ -10,9 +10,19 @@ Root `quosh-server` on UDP 443 + Unix socket. `quosh user@host` creates a login 
 
 Implemented: shared `quosh-predict` crate (adaptive/never), `echo_ack` in the QS2 screen payload, server-side write-completion checkpoints, and CLI wiring with RTT estimate and timer-driven reconciliation. Design and evidence: [12-prediction.md](12-prediction.md).
 
-## Slice 3 — PWA
+## Slice 3 — browser reference
 
-Static app at `https://quosh.jtcs.dev`. Client `quosh enroll [--ssh=cmd] user@host` prints the authenticated link/QR. Passkeys bound to the enrol uid, with WebAuthn identity `<unix_user>@<server_address>`. Reconnect without SSH via a pinned certificate chain of 7 certs on a 13-day stride with 14-day validity (~92 days), topped up per connection to ~92 days from the last connect. Same WebTransport endpoint. Unmodified blit-browser only if it can consume our frames without patches. Design: [13-browser-auth-and-trust.md](13-browser-auth-and-trust.md).
+Extract `quosh-client` (transport-agnostic session state machine) and move the
+CLI onto it, then build the `@quosh/*` browser libraries and a thin reference
+PWA that composes them. Static website at `https://quosh.jtcs.dev`
+(installable PWA later). Client `quosh enroll [--ssh=cmd] user@host` prints the
+authenticated link/QR. Passkeys bound to the enrol uid, with WebAuthn identity
+`<unix_user>@<server_address>`. Reconnect without SSH via a pinned certificate
+chain of 7 certs on a 13-day stride with 14-day validity (~92 days), topped up
+per connection to ~92 days from the last connect. Same WebTransport endpoint.
+Unmodified blit-browser only if it can consume our frames without patches.
+Design: [13-browser-auth-and-trust.md](13-browser-auth-and-trust.md) and
+[14-libraries-and-reference-app.md](14-libraries-and-reference-app.md).
 
 ## Later
 
