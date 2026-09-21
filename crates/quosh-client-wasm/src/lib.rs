@@ -59,6 +59,11 @@ impl FrameView {
     pub fn cells(&self) -> Vec<u8> {
         self.frame.cells().to_vec()
     }
+
+    /// Resolved text for one cell (overflow-table aware).
+    pub fn cell_content(&self, row: u16, col: u16) -> String {
+        self.frame.cell_content(row, col).to_string()
+    }
 }
 
 /// The transport-agnostic client state machine.

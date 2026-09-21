@@ -55,6 +55,13 @@ Build the three wasm packages with `tools/build-wasm.sh` (needs the
 `web/pkg/<name>/`; `node tools/wasm-smoke.cjs` exercises the generated
 bindings. Generated output is not committed.
 
+The **reference PWA** lives in `web/` (plain TypeScript, no framework) and
+currently folds the not-yet-separate `@quosh/auth`, `@quosh/transport`, and
+`@quosh/terminal` responsibilities into `src/auth.ts`, `src/transport.ts`,
+`src/session.ts`, `src/render.ts`, and `src/keybar.ts`. Its pure logic (link
+parsing, cell decoding, key encoding) is unit-tested in Node; the browser-only
+paths need a real browser. See `web/README.md`.
+
 The reference PWA composes the browser packages; the CLI composes the crates.
 
 ## Constraints

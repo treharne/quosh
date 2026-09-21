@@ -9,3 +9,7 @@
 
 # Generated wasm packages (see tools/build-wasm.sh). Build output, not source.
 /web/pkg/
+
+# Web build: dependencies and generated bundle.
+/web/node_modules/
+/web/dist/

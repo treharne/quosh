@@ -77,6 +77,12 @@ impl ScreenView {
     pub fn cells(&self) -> Vec<u8> {
         self.frame.cells().to_vec()
     }
+
+    /// Resolved text for one cell (the raw bytes may point at the overflow
+    /// table for long grapheme clusters).
+    pub fn cell_content(&self, row: u16, col: u16) -> String {
+        self.frame.cell_content(row, col).to_string()
+    }
 }
 
 /// Decode a QS2 control-frame screen payload.
@@ -136,6 +142,12 @@ impl FrameBuffer {
             Some((typ, payload)) => Ok(Some(FrameView { typ, payload })),
             None => Ok(None),
         }
+    }
+
+    /// Bytes the reader has not consumed yet. After the auth handshake, hand
+    /// these to the client so nothing is lost between phases.
+    pub fn remaining(&self) -> Vec<u8> {
+        self.buf.clone()
     }
 }
 

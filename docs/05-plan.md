@@ -35,7 +35,11 @@ verification, durable device registrations with sliding session tokens,
 one-time enrolment nonces, the `enroll-nonce`/`devices`/`revoke` helper ops,
 and `quosh enroll` / `quosh devices` / `quosh revoke`. The WebTransport auth
 handshake (enrolment / assertion / token) is wired into the control stream.
-Next: WASM bindings and the PWA.
+The three `@quosh/*` wasm packages are built by `tools/build-wasm.sh`, and a
+reference PWA lives in `web/` (plain TypeScript, canvas renderer, key bar,
+IndexedDB server list). Next: exercise the PWA against a live server in a real
+browser and split the remaining TS responsibilities into `@quosh/auth`,
+`@quosh/transport`, and `@quosh/terminal`.
 
 ## Later
 
