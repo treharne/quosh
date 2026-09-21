@@ -33,15 +33,27 @@ Rust crates:
 Browser-facing (npm workspace, separate packages):
 
 - `@quosh/proto` — wire framing and QS2 screen decode (`wasm-bindgen`).
+  **Implemented**: `crates/quosh-proto-wasm` exposes `FrameBuffer`,
+  `FrameFeed`, `decodeScreen`, and the auth-handshake codecs.
 - `@quosh/predict` — prediction engine bindings (`wasm-bindgen`).
+  **Implemented**: `crates/quosh-predict-wasm` exposes `Frame` and `Predictor`.
 - `@quosh/client` — transport-agnostic session state-machine bindings
-  (`wasm-bindgen`), driven by events and emitting actions.
+  (`wasm-bindgen`), driven by events and emitting actions. **Implemented**:
+  `crates/quosh-client-wasm` exposes `Client` (feed it bytes + `now_ms`,
+  drain `outbound`, read `display()`).
 - `@quosh/auth` — passkey enrol/attach, certificate-hash chain, session token,
-  server list in IndexedDB.
+  server list in IndexedDB. Not built yet; the wire codecs it needs are in
+  `@quosh/proto`.
 - `@quosh/transport` — browser WebTransport adapter (pinned hashes, control
-  stream, datagrams).
+  stream, datagrams). Not built yet.
 - `@quosh/terminal` — confirmed frame state, renderer integration (Blit or
-  thin), key bar and input mapping.
+  thin), key bar and input mapping. Not built yet.
+
+Build the three wasm packages with `tools/build-wasm.sh` (needs the
+`wasm32-unknown-unknown` target and a matching `wasm-bindgen` 0.2.100 on
+`PATH`). It writes ESM glue for the PWA and CommonJS glue for Node under
+`web/pkg/<name>/`; `node tools/wasm-smoke.cjs` exercises the generated
+bindings. Generated output is not committed.
 
 The reference PWA composes the browser packages; the CLI composes the crates.
 

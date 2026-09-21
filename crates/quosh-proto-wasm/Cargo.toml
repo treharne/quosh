@@ -1,0 +1,14 @@
+[package]
+name = "quosh-proto-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+quosh-proto.workspace = true
+blit-remote.workspace = true
+hex.workspace = true
+wasm-bindgen.workspace = true

@@ -6,3 +6,6 @@
 
 # Generated test credentials. Never commit.
 /.test-keys/
+
+# Generated wasm packages (see tools/build-wasm.sh). Build output, not source.
+/web/pkg/
