@@ -1,6 +1,7 @@
 //! PTY-driven CLI session tests and a bounded lossy-link soak.
 //! Spawns the real `quosh` binary against an in-process `quosh-server`.
 
+use base64::Engine as _;
 use quosh_server::helper::Daemon;
 use quosh_server::pty::open_cloexec;
 use quosh_server::transport::handle_incoming;
@@ -163,7 +164,12 @@ impl Stack {
         let daemon = Arc::new(Daemon {
             sessions: sessions.clone(),
             chain,
+            devices: quosh_server::devices::DeviceStore::load(&dir.join("devices.json"))
+                .expect("devices"),
+            nonces: quosh_server::enroll::NonceStore::new(),
             port: proxy.addr.port(),
+            rp_id: "quosh.jtcs.dev".into(),
+            origin: "https://quosh.jtcs.dev".into(),
         });
         let helper = tokio::spawn({
             let d = daemon.clone();
@@ -190,10 +196,10 @@ impl Stack {
              args=()\n\
              seen=0\n\
              for a in \"$@\"; do\n\
-               if [ \"$a\" = \"create-session\" ]; then seen=1; fi\n\
+               case \"$a\" in create-session|enroll-helper|devices|revoke) seen=1;; esac\n\
                if [ \"$seen\" = 1 ]; then args+=(\"$a\"); fi\n\
              done\n\
-             if [ \"$seen\" != 1 ]; then echo 'fake-ssh: no create-session' >&2; exit 1; fi\n\
+             if [ \"$seen\" != 1 ]; then echo 'fake-ssh: no subcommand' >&2; exit 1; fi\n\
              exec \"$QUOSH_TEST_BIN\" --socket \"$QUOSH_TEST_SOCK\" \"${args[@]}\"\n",
         )
         .unwrap();
@@ -848,5 +854,64 @@ async fn cli_sets_and_restores_the_tab_title() {
     assert!(
         cli.output().contains("\x1b[23;0t"),
         "title stack was not popped on exit"
+    );
+}
+
+/// `quosh enroll` asks the server (over the fake SSH hop) for a nonce and
+/// prints a `#enroll` link whose payload carries the current certificate hash
+/// and the nonce; `quosh devices` then runs against the socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_enroll_prints_a_link_and_devices_lists() {
+    let stack = Stack::start().await;
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_quosh"));
+    let out = Command::new(&bin)
+        .arg(format!("--ssh={}", stack.fake_ssh.display()))
+        .arg("enroll")
+        .arg("--base-url")
+        .arg("https://example.test")
+        .arg("quoshtest@127.0.0.1")
+        .env("QUOSH_TEST_BIN", &bin)
+        .env("QUOSH_TEST_SOCK", &stack.socket)
+        .output()
+        .await
+        .expect("run quosh enroll");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let url = stdout
+        .lines()
+        .find(|l| l.starts_with("https://example.test/e#enroll="))
+        .unwrap_or_else(|| panic!("no enrol link in:\n{stdout}"));
+    let encoded = url.split("#enroll=").nth(1).unwrap();
+    let payload: quosh_proto::EnrollPayload = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload.host, "127.0.0.1");
+    assert_eq!(payload.hash.len(), 64);
+    assert_eq!(payload.nonce.len(), 32);
+    assert!(!payload.user.is_empty());
+
+    let out = Command::new(&bin)
+        .arg("--socket")
+        .arg(&stack.socket)
+        .arg("devices")
+        .output()
+        .await
+        .expect("run quosh devices");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("no enrolled devices"),
+        "unexpected devices output: {}",
+        String::from_utf8_lossy(&out.stdout)
     );
 }

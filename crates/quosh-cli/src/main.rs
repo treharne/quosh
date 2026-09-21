@@ -1,10 +1,12 @@
 use anyhow::{Context, Result, bail};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use blit_remote::FrameState;
 use clap::{Parser, Subcommand};
 use quosh_client::{Client, ClientError, Tick};
 use quosh_proto::{
-    CONNECT_PREFIX, DEFAULT_PORT, HelperRequest, HelperResponse, MODE_BRACKETED_PASTE,
-    MODE_CURSOR_VISIBLE, WT_PATH, frame_ansi, parse_connect_line,
+    CONNECT_PREFIX, DEFAULT_PORT, EnrollPayload, HelperRequest, HelperResponse,
+    MODE_BRACKETED_PASTE, MODE_CURSOR_VISIBLE, WT_PATH, frame_ansi, parse_connect_line,
 };
 use std::collections::VecDeque;
 use std::fs::File;
@@ -28,7 +30,7 @@ const REMOTE_QUOSH: &str = "/usr/local/bin/quosh";
 #[command(name = "quosh", about = "Mosh-style remote shell over WebTransport")]
 struct Args {
     /// SSH command used to reach the server (default: ssh).
-    #[arg(long, default_value = "ssh")]
+    #[arg(long, default_value = "ssh", global = true)]
     ssh: String,
     /// Local echo prediction: adaptive (default) or never.
     #[arg(long, value_enum, default_value_t = PredictMode::Adaptive)]
@@ -61,6 +63,30 @@ enum Cmd {
         #[arg(long)]
         idle_only: bool,
     },
+    /// Remote helper: mint an enrolment nonce (invoked over SSH).
+    #[command(hide = true)]
+    EnrollHelper,
+    /// Print an enrolment link for a browser passkey.
+    Enroll {
+        /// user@host.
+        target: String,
+        /// Base URL of the PWA that handles the link.
+        #[arg(long, default_value = "https://quosh.jtcs.dev")]
+        base_url: String,
+    },
+    /// List this user's passkey registrations and live session tokens.
+    Devices,
+    /// Revoke a passkey registration and its session tokens.
+    Revoke {
+        /// Credential id (or unique prefix) to revoke.
+        credential: Option<String>,
+        /// Revoke every registration and token for this user.
+        #[arg(long)]
+        all: bool,
+        /// Revoke only live session tokens, keeping registrations.
+        #[arg(long)]
+        sessions: bool,
+    },
 }
 
 #[tokio::main]
@@ -73,6 +99,14 @@ async fn main() -> Result<()> {
             kill_idle,
             idle_only,
         }) => helper(&args.socket, cols, rows, kill_idle, idle_only).await,
+        Some(Cmd::EnrollHelper) => enroll_helper(&args.socket).await,
+        Some(Cmd::Enroll { target, base_url }) => enroll(&args.ssh, &target, &base_url).await,
+        Some(Cmd::Devices) => devices(&args.socket).await,
+        Some(Cmd::Revoke {
+            credential,
+            all,
+            sessions,
+        }) => revoke(&args.socket, credential, all, sessions).await,
         None => {
             let Some(target) = args.target else {
                 bail!("usage: quosh [--ssh=cmd] user@host");
@@ -82,14 +116,8 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn helper(
-    socket: &PathBuf,
-    cols: u16,
-    rows: u16,
-    kill_idle: bool,
-    idle_only: bool,
-) -> Result<()> {
-    let stream = match UnixStream::connect(socket).await {
+async fn socket_query(socket: &PathBuf, req: &HelperRequest) -> Result<HelperResponse> {
+    let mut stream = match UnixStream::connect(socket).await {
         Ok(s) => s,
         Err(_) => {
             eprintln!(
@@ -99,27 +127,29 @@ async fn helper(
             std::process::exit(2);
         }
     };
-    let req = if idle_only {
-        HelperRequest {
-            op: "idle".into(),
-            cols: 0,
-            rows: 0,
-            kill_idle: false,
-        }
-    } else {
-        HelperRequest {
-            op: "create".into(),
-            cols,
-            rows,
-            kill_idle,
-        }
-    };
-    let mut stream = stream;
-    let line = serde_json::to_string(&req)? + "\n";
+    let line = serde_json::to_string(req)? + "\n";
     stream.write_all(line.as_bytes()).await?;
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await?;
-    let resp: HelperResponse = serde_json::from_slice(buf.trim_ascii())?;
+    Ok(serde_json::from_slice(buf.trim_ascii())?)
+}
+
+async fn helper(
+    socket: &PathBuf,
+    cols: u16,
+    rows: u16,
+    kill_idle: bool,
+    idle_only: bool,
+) -> Result<()> {
+    let op = if idle_only { "idle" } else { "create" };
+    let req = HelperRequest {
+        op: op.into(),
+        cols,
+        rows,
+        kill_idle,
+        ..Default::default()
+    };
+    let resp = socket_query(socket, &req).await?;
     if !resp.ok {
         bail!("{}", resp.error.unwrap_or_else(|| "create failed".into()));
     }
@@ -137,6 +167,102 @@ async fn helper(
         )
     );
     Ok(())
+}
+
+/// Hidden helper: mint an enrolment nonce and print the raw reply as JSON.
+async fn enroll_helper(socket: &PathBuf) -> Result<()> {
+    let req = HelperRequest {
+        op: "enroll-nonce".into(),
+        ..Default::default()
+    };
+    let resp = socket_query(socket, &req).await?;
+    println!("{}", serde_json::to_string(&resp)?);
+    Ok(())
+}
+
+async fn devices(socket: &PathBuf) -> Result<()> {
+    let req = HelperRequest {
+        op: "devices".into(),
+        ..Default::default()
+    };
+    let resp = socket_query(socket, &req).await?;
+    if !resp.ok {
+        bail!("{}", resp.error.unwrap_or_else(|| "devices failed".into()));
+    }
+    if resp.devices.is_empty() && resp.sessions.is_empty() {
+        println!("no enrolled devices or sessions");
+    }
+    for d in &resp.devices {
+        println!(
+            "credential {}  {}  created {}  last used {}",
+            short(&d.credential),
+            d.user,
+            d.created,
+            d.last_used
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "never".into()),
+        );
+    }
+    for s in &resp.sessions {
+        println!("session {}  last seen {}", short(&s.token), s.last_seen);
+    }
+    Ok(())
+}
+
+async fn revoke(
+    socket: &PathBuf,
+    credential: Option<String>,
+    all: bool,
+    sessions: bool,
+) -> Result<()> {
+    let req = HelperRequest {
+        op: "revoke".into(),
+        credential,
+        all,
+        sessions,
+        ..Default::default()
+    };
+    let resp = socket_query(socket, &req).await?;
+    if !resp.ok {
+        bail!("{}", resp.error.unwrap_or_else(|| "revoke failed".into()));
+    }
+    println!("revoked {}", resp.revoked.unwrap_or(0));
+    Ok(())
+}
+
+/// Client-side enrolment: ask the server (over SSH) for a nonce, then print a
+/// link the browser opens to register a passkey.
+async fn enroll(ssh: &str, target: &str, base_url: &str) -> Result<()> {
+    let raw = ssh_helper(ssh, target, &["enroll-helper"]).await?;
+    let json = raw
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .context("no helper reply from server")?;
+    let resp: HelperResponse = serde_json::from_str(json.trim())?;
+    if !resp.ok {
+        bail!("{}", resp.error.unwrap_or_else(|| "enrol failed".into()));
+    }
+    let host = ssh_hostname(ssh, target).await?;
+    let payload = EnrollPayload {
+        v: 1,
+        host,
+        port: resp.port.unwrap_or(DEFAULT_PORT),
+        hash: resp.cert_sha256.context("missing cert hash")?,
+        nonce: resp.nonce.context("missing nonce")?,
+        user: resp
+            .user
+            .unwrap_or_else(|| target.split('@').next().unwrap_or("user").into()),
+    };
+    let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload)?);
+    let url = format!("{}/e#enroll={encoded}", base_url.trim_end_matches('/'));
+    eprintln!("Open this link in a browser on this machine to enrol a passkey:\n");
+    println!("{url}");
+    Ok(())
+}
+
+fn short(s: &str) -> &str {
+    &s[..s.len().min(16)]
 }
 
 fn hex16(s: Option<&str>) -> Result<[u8; 16]> {

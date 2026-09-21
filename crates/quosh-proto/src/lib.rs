@@ -706,7 +706,7 @@ fn hex_32(s: &str) -> Result<[u8; 32]> {
     v.try_into().map_err(|_| Error::Frame)
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct HelperRequest {
     pub op: String,
     #[serde(default)]
@@ -715,15 +715,40 @@ pub struct HelperRequest {
     pub rows: u16,
     #[serde(default)]
     pub kill_idle: bool,
+    /// Credential id (hex) for `revoke`.
+    #[serde(default)]
+    pub credential: Option<String>,
+    /// `revoke --all`.
+    #[serde(default)]
+    pub all: bool,
+    /// `revoke --sessions`.
+    #[serde(default)]
+    pub sessions: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct IdleInfo {
     pub id: String,
     pub idle_secs: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// One passkey registration, for `quosh devices`.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct DeviceInfo {
+    pub credential: String,
+    pub user: String,
+    pub created: i64,
+    pub last_used: Option<i64>,
+}
+
+/// One live session token, for `quosh devices`.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct SessionInfo {
+    pub token: String,
+    pub last_seen: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct HelperResponse {
     pub ok: bool,
     #[serde(default)]
@@ -738,6 +763,31 @@ pub struct HelperResponse {
     pub cert_sha256: Option<String>,
     #[serde(default)]
     pub idle: Vec<IdleInfo>,
+    /// Enrolment nonce (hex) from `enroll-nonce`.
+    #[serde(default)]
+    pub nonce: Option<String>,
+    /// Unix user name for the WebAuthn display name.
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub devices: Vec<DeviceInfo>,
+    #[serde(default)]
+    pub sessions: Vec<SessionInfo>,
+    /// Count removed by `revoke`.
+    #[serde(default)]
+    pub revoked: Option<usize>,
+}
+
+/// The `#enroll=` fragment the browser parses. All ids are hex so the payload
+/// is plain JSON and survives a QR/URL round trip.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct EnrollPayload {
+    pub v: u8,
+    pub host: String,
+    pub port: u16,
+    pub hash: String,
+    pub nonce: String,
+    pub user: String,
 }
 
 #[cfg(test)]

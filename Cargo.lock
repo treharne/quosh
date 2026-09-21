@@ -1245,6 +1245,7 @@ name = "quosh"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "blit-remote",
  "clap",
  "hex",
@@ -1299,6 +1300,7 @@ name = "quosh-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "blit-alacritty-terminal",
  "blit-remote",
  "clap",
@@ -1308,8 +1310,10 @@ dependencies = [
  "quosh-proto",
  "rand 0.9.5",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pemfile",
+ "serde",
  "serde_json",
  "sha2",
  "time",

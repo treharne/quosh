@@ -20,6 +20,7 @@ blit-remote.workspace = true
 libc = "0.2"
 nix = { version = "0.30", features = ["term", "fs"] }
 url = "2"
+base64 = "0.22"
 web-transport-quinn = { version = "0.12", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 

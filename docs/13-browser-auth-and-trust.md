@@ -1,8 +1,12 @@
 # Browser authentication and server trust (slice 3)
 
-Status: agreed design. The server trust foundation is implemented (see
-"Certificate chain" below); enrolment and passkey are not. Where this conflicts
-with the one-line PWA note in [v1 spec](11-v1-spec.md), this document wins.
+Status: agreed design, partly implemented. The server trust foundation (see
+"Certificate chain" below) and the server-side auth core — WebAuthn
+verification, durable device registrations, one-time enrolment nonces, and the
+`quosh enroll` / `quosh devices` / `quosh revoke` commands — are implemented.
+The WebTransport auth handshake and the browser/PWA are not. Where this
+conflicts with the one-line PWA note in [v1 spec](11-v1-spec.md), this document
+wins.
 
 ## Goal
 
@@ -53,6 +57,16 @@ credential. Both are needed.
   anchor of last resort. Passkey `largeBlob`/`prf` are optional hardening.
 
 ## Enrolment (client-side, once)
+
+Implemented so far: the server-side WebAuthn verification
+(`crates/quosh-server/src/webauthn.rs`, registration and assertion, ES256/P-256,
+user presence + verification, challenge/origin/RP-ID checked); durable
+device registrations and sliding session tokens
+(`crates/quosh-server/src/devices.rs`); one-time nonces
+(`crates/quosh-server/src/enroll.rs`); the `enroll-nonce` / `devices` / `revoke`
+helper ops; and the client `quosh enroll` link builder plus server-side
+`quosh devices` / `quosh revoke`. The steps below that run over a WebTransport
+connection (3 onward) are not wired yet.
 
 `quosh enroll` is a **client** command, like `quosh user@host`. A server-local
 `quosh enroll` may be added later.

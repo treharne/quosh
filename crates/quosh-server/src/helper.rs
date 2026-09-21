@@ -1,7 +1,11 @@
 use crate::cert::CertChain;
+use crate::devices::DeviceStore;
+use crate::enroll::NonceStore;
 use crate::session::{Session, spawn_pair};
 use anyhow::Result;
-use quosh_proto::{HelperRequest, HelperResponse, IDLE_SECS, IdleInfo, validate_dims};
+use quosh_proto::{
+    DeviceInfo, HelperRequest, HelperResponse, IDLE_SECS, IdleInfo, SessionInfo, validate_dims,
+};
 use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,11 +21,24 @@ const MAX_HELPER_BYTES: usize = 4096;
 const MAX_SESSIONS: usize = 128;
 const MAX_PER_UID: usize = 32;
 
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 #[derive(Clone)]
 pub struct Daemon {
     pub sessions: Registry,
     pub chain: Arc<CertChain>,
+    pub devices: Arc<DeviceStore>,
+    pub nonces: Arc<NonceStore>,
     pub port: u16,
+    /// WebAuthn Relying Party ID.
+    pub rp_id: String,
+    /// Expected WebAuthn origin.
+    pub origin: String,
 }
 
 impl Daemon {
@@ -63,19 +80,79 @@ impl Daemon {
             Ok(h) => hex::encode(h),
             Err(e) => return fail(format!("certificate: {e:#}")),
         };
+        let base = || HelperResponse {
+            ok: true,
+            port: Some(self.port),
+            cert_sha256: Some(cert.clone()),
+            ..Default::default()
+        };
         match req.op.as_str() {
-            "idle" => self.list_idle(uid, cert).await,
-            "ping" => HelperResponse {
-                ok: true,
-                error: None,
-                session_id: None,
-                token: None,
-                port: Some(self.port),
-                cert_sha256: Some(cert),
-                idle: vec![],
-            },
-            "create" => self.create(uid, req, cert).await,
+            "idle" => {
+                let mut r = base();
+                r.idle = self.collect_idle(uid).await;
+                r
+            }
+            "ping" => base(),
+            "create" => self.create(uid, req, base()).await,
+            "enroll-nonce" => self.enroll_nonce(uid, base()),
+            "devices" => self.list_devices(uid, base()),
+            "revoke" => self.revoke(uid, &req, base()),
             other => fail(format!("unknown op {other}")),
+        }
+    }
+
+    /// Mint a one-time enrolment nonce bound to the SSH-authenticated uid.
+    fn enroll_nonce(&self, uid: u32, mut resp: HelperResponse) -> HelperResponse {
+        let nonce = self.nonces.issue(uid, now());
+        resp.nonce = Some(hex::encode(nonce));
+        resp.user = unix_name(uid);
+        resp
+    }
+
+    fn list_devices(&self, uid: u32, mut resp: HelperResponse) -> HelperResponse {
+        resp.devices = self
+            .devices
+            .registrations(uid)
+            .into_iter()
+            .map(|r| DeviceInfo {
+                credential: r.credential_id,
+                user: r.user_name,
+                created: r.created,
+                last_used: r.last_used,
+            })
+            .collect();
+        resp.sessions = self
+            .devices
+            .tokens(uid)
+            .into_iter()
+            .map(|(token, last_seen)| SessionInfo { token, last_seen })
+            .collect();
+        resp
+    }
+
+    fn revoke(&self, uid: u32, req: &HelperRequest, mut resp: HelperResponse) -> HelperResponse {
+        let result = if req.all {
+            self.devices.revoke_all(uid).map(|n| (n, "registrations"))
+        } else if req.sessions {
+            self.devices.revoke_sessions(uid).map(|n| (n, "sessions"))
+        } else if let Some(prefix) = &req.credential {
+            match resolve_credential(&self.devices, uid, prefix) {
+                Ok(cred) => self
+                    .devices
+                    .revoke_credential(uid, &cred)
+                    .map(|ok| (ok as usize, "credential")),
+                Err(e) => return fail(e),
+            }
+        } else {
+            return fail("revoke needs a credential, --all, or --sessions");
+        };
+        match result {
+            Ok((n, what)) => {
+                info!("revoked {n} {what} for uid {uid}");
+                resp.revoked = Some(n);
+                resp
+            }
+            Err(e) => fail(format!("revoke: {e:#}")),
         }
     }
 
@@ -98,19 +175,12 @@ impl Daemon {
         idle
     }
 
-    async fn list_idle(&self, uid: u32, cert: String) -> HelperResponse {
-        HelperResponse {
-            ok: true,
-            error: None,
-            session_id: None,
-            token: None,
-            port: Some(self.port),
-            cert_sha256: Some(cert),
-            idle: self.collect_idle(uid).await,
-        }
-    }
-
-    async fn create(&self, uid: u32, req: HelperRequest, cert: String) -> HelperResponse {
+    async fn create(
+        &self,
+        uid: u32,
+        req: HelperRequest,
+        mut resp: HelperResponse,
+    ) -> HelperResponse {
         let cols = if req.cols == 0 { 80 } else { req.cols };
         let rows = if req.rows == 0 { 24 } else { req.rows };
         if let Err(e) = validate_dims(cols, rows) {
@@ -158,15 +228,10 @@ impl Daemon {
                 drop(g);
                 sess.start(self.sessions.clone(), owner);
                 info!("session {} uid {uid} {}x{}", hex::encode(id), cols, rows);
-                HelperResponse {
-                    ok: true,
-                    error: None,
-                    session_id: Some(hex::encode(id)),
-                    token: Some(hex::encode(token)),
-                    port: Some(self.port),
-                    cert_sha256: Some(cert),
-                    idle,
-                }
+                resp.session_id = Some(hex::encode(id));
+                resp.token = Some(hex::encode(token));
+                resp.idle = idle;
+                resp
             }
             Err(e) => {
                 let mut r = fail(format!("{e:#}"));
@@ -181,11 +246,35 @@ fn fail(msg: impl Into<String>) -> HelperResponse {
     HelperResponse {
         ok: false,
         error: Some(msg.into()),
-        session_id: None,
-        token: None,
-        port: None,
-        cert_sha256: None,
-        idle: vec![],
+        ..Default::default()
+    }
+}
+
+/// Work out the display name `<unix_user>@<server>` uses. Only the user part
+/// comes from the server; the browser knows the address.
+fn unix_name(uid: u32) -> Option<String> {
+    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|u| u.name)
+}
+
+/// Resolve a full credential id or a unique prefix (matching what `quosh
+/// devices` shows).
+fn resolve_credential(
+    devices: &DeviceStore,
+    uid: u32,
+    prefix: &str,
+) -> std::result::Result<String, String> {
+    let matches: Vec<_> = devices
+        .registrations(uid)
+        .into_iter()
+        .filter(|r| r.credential_id.starts_with(prefix))
+        .collect();
+    match matches.len() {
+        1 => Ok(matches.into_iter().next().unwrap().credential_id),
+        0 => Err(format!("no credential matching {prefix}")),
+        n => Err(format!("{n} credentials match {prefix}; be more specific")),
     }
 }
 
@@ -244,7 +333,19 @@ mod tests {
         Daemon {
             sessions: Arc::new(Mutex::new(Default::default())),
             chain,
+            devices: DeviceStore::load(&dir.join("devices.json")).expect("devices"),
+            nonces: NonceStore::new(),
             port: 7,
+            rp_id: "quosh.jtcs.dev".into(),
+            origin: "https://quosh.jtcs.dev".into(),
+        }
+    }
+
+    fn ok_resp() -> HelperResponse {
+        HelperResponse {
+            ok: true,
+            port: Some(7),
+            ..Default::default()
         }
     }
 
@@ -273,6 +374,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enroll_nonce_and_device_ops() {
+        use crate::devices::Registration;
+        let uid = Uid::current().as_raw();
+        let daemon = test_daemon();
+
+        let r = daemon
+            .dispatch(
+                uid,
+                HelperRequest {
+                    op: "enroll-nonce".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(r.ok);
+        let nonce: [u8; 16] = hex::decode(r.nonce.unwrap()).unwrap().try_into().unwrap();
+        assert_eq!(daemon.nonces.consume(&nonce, now()), Some(uid));
+        // Single use.
+        assert_eq!(daemon.nonces.consume(&nonce, now()), None);
+
+        daemon
+            .devices
+            .register(Registration {
+                uid,
+                credential_id: "abcdef0123456789".into(),
+                public_key: "04".into(),
+                rp_id: daemon.rp_id.clone(),
+                origin: daemon.origin.clone(),
+                user_name: format!("{uid}@host"),
+                sign_count: 0,
+                created: 1,
+                last_used: None,
+            })
+            .unwrap();
+        let r = daemon
+            .dispatch(
+                uid,
+                HelperRequest {
+                    op: "devices".into(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(r.devices.len(), 1);
+        assert_eq!(r.devices[0].credential, "abcdef0123456789");
+
+        // Revoke by the short prefix shown in `quosh devices`.
+        let r = daemon
+            .dispatch(
+                uid,
+                HelperRequest {
+                    op: "revoke".into(),
+                    credential: Some("abcdef".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(r.revoked, Some(1));
+        assert!(
+            daemon
+                .dispatch(
+                    uid,
+                    HelperRequest {
+                        op: "devices".into(),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .devices
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_create_respects_per_uid_limit() {
         let uid = Uid::current().as_raw();
         let daemon = test_daemon();
@@ -292,15 +467,13 @@ mod tests {
             cols: 80,
             rows: 24,
             kill_idle: false,
+            ..Default::default()
         };
         let d1 = daemon.clone();
         let d2 = daemon.clone();
         let r1 = req.clone();
         let r2 = req;
-        let (a, b) = tokio::join!(
-            d1.create(uid, r1, String::new()),
-            d2.create(uid, r2, String::new())
-        );
+        let (a, b) = tokio::join!(d1.create(uid, r1, ok_resp()), d2.create(uid, r2, ok_resp()));
         let oks = [a.ok, b.ok].into_iter().filter(|x| *x).count();
         assert_eq!(
             oks, 1,
@@ -341,8 +514,9 @@ mod tests {
                     cols: 80,
                     rows: 24,
                     kill_idle: true,
+                    ..Default::default()
                 },
-                String::new(),
+                ok_resp(),
             )
             .await;
         assert!(resp.ok, "idle cleanup should free a slot: {:?}", resp.error);

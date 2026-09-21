@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use quosh_server::cert::{self, CertChain};
+use quosh_server::devices::DeviceStore;
+use quosh_server::enroll::NonceStore;
 use quosh_server::helper::{self, Daemon};
 use quosh_server::transport::handle_incoming;
 use std::path::PathBuf;
@@ -24,6 +26,12 @@ struct Args {
     /// Number of certificates in the rotation window.
     #[arg(long, default_value_t = cert::DEFAULT_CHAIN)]
     cert_chain: usize,
+    /// WebAuthn Relying Party ID.
+    #[arg(long, default_value = "quosh.jtcs.dev")]
+    rp_id: String,
+    /// Expected WebAuthn origin.
+    #[arg(long, default_value = "https://quosh.jtcs.dev")]
+    origin: String,
 }
 
 #[tokio::main]
@@ -72,7 +80,11 @@ async fn main() -> Result<()> {
     let daemon = Arc::new(Daemon {
         sessions: Arc::new(tokio::sync::Mutex::new(Default::default())),
         chain: chain.clone(),
+        devices: DeviceStore::load(&args.data_dir.join("devices.json"))?,
+        nonces: NonceStore::new(),
         port,
+        rp_id: args.rp_id.clone(),
+        origin: args.origin.clone(),
     });
     let d2 = daemon.clone();
     tokio::spawn(async move {
