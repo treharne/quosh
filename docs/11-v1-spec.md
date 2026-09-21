@@ -22,7 +22,8 @@ The first complete demo still needs CLI **and** Chrome. Build order:
 |---|---|---|
 | PWA origin | `https://quosh.jtcs.dev` (static host, no app backend) | Server-hosted PWA |
 | Out-of-band channel | SSH only | Long-lived identity without SSH |
-| Browser enrol | `ssh user@host quosh enrol` prints an authenticated `https://quosh.jtcs.dev/...` link | — |
+| Browser enrol | Client `quosh enroll [--ssh=cmd] user@host` prints an authenticated `https://quosh.jtcs.dev/e#enroll=...` link/QR | Server-local `quosh enroll` |
+| Device management | Server-side `quosh devices` / `quosh revoke` (`SO_PEERCRED`) | PWA-initiated revocation |
 | CLI auth | SSH on every `quosh user@host`, like Mosh | Passkey CLI |
 | Invocation | `quosh [--ssh=cmd] user@host` → login shell | Arbitrary remote command |
 | Sessions | Connect without id creates a shell. Live process reconnects with that id. Close / `exit` / hangup ends it. New tab/process always creates. | Herdr-style reattach from a new client |

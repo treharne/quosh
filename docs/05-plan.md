@@ -12,11 +12,11 @@ Implemented: shared `quosh-predict` crate (adaptive/never), `echo_ack` in the QS
 
 ## Slice 3 — PWA
 
-Static app at `https://quosh.jtcs.dev`. SSH `quosh enrol` prints the authenticated link. Passkeys bound to the enrol uid, with WebAuthn identity `<unix_user>@<server_address>`. Reconnect without SSH via a pinned certificate chain of 7 × ≤14-day certs (~98 days), topped up per connection to 98 days from the last connect. Same WebTransport endpoint. Unmodified blit-browser only if it can consume our frames without patches. Design: [13-browser-auth-and-trust.md](13-browser-auth-and-trust.md).
+Static app at `https://quosh.jtcs.dev`. Client `quosh enroll [--ssh=cmd] user@host` prints the authenticated link/QR. Passkeys bound to the enrol uid, with WebAuthn identity `<unix_user>@<server_address>`. Reconnect without SSH via a pinned certificate chain of 7 certs on a 13-day stride with 14-day validity (~92 days), topped up per connection to ~92 days from the last connect. Same WebTransport endpoint. Unmodified blit-browser only if it can consume our frames without patches. Design: [13-browser-auth-and-trust.md](13-browser-auth-and-trust.md).
 
 ## Later
 
-Arbitrary remote commands; passkey CLI; system-hosted PWA; longer-lived identity without SSH; Herdr-on-Quosh; iOS/Android.
+Arbitrary remote commands; passkey CLI; server-local `quosh enrol`; system-hosted PWA; longer-lived identity without SSH; Herdr-on-Quosh; iOS/Android.
 
 ## Evidence
 

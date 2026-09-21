@@ -29,49 +29,63 @@ credential. Both are needed.
   - Every Quosh server shares the RP ID, so the server address is what keeps
     `ubuntu@server1` and `ubuntu@server2` from colliding. This lets one
     passkey manager hold separate credentials per server.
-- **User authentication:** passkey. A long-lived, revocable **device token**
-  avoids a passkey prompt on every reconnect; the passkey is the root
-  credential and the fallback after token expiry, revocation, or storage loss.
-  The device token TTL is a UX choice, not a security boundary: the passkey
-  can always re-authenticate without SSH.
+- **User authentication:** the passkey is the durable root. A short-lived,
+  revocable **session token** carries only an *active* session so routine
+  transport reconnects are silent. It expires after **60 minutes without any
+  session activity**, and any cold start, expiry, revocation, or storage loss
+  falls back to the passkey. A long-lived bearer token would make the passkey
+  decorative, so the token is deliberately short: the passkey is the user's
+  long-lived credential, the certificate chain is the server's.
 - **Server authentication:** pinned self-signed ECDSA P-256 certificates via
-  WebTransport `serverCertificateHashes`. A **chain of 7 certificates of at
-  most 14 days each, ≈98 days**, delivered at enrolment and topped up on every
-  authenticated connection so coverage is always at least **98 days from the
-  last connection**.
+  WebTransport `serverCertificateHashes`. A **chain of 7 certificates on a
+  13-day stride with 14-day validity** (1-day overlap, ≈92 days), delivered at
+  enrolment and topped up on every authenticated connection so coverage is
+  always at least **92 days from the last connection**.
 - **Server identity key:** one long-lived key, persisted under `/var/lib/quosh`
   and reused for every certificate in the chain (certificates differ only in
   validity dates). The epoch schedule is deterministic and stable across
   restarts; a restart must not invalidate cached hashes.
 - **Client storage:** IndexedDB (or localStorage) for the server address, the
-  certificate-hash set, and the device token. Hashes are public pins; the
-  device token is the only client secret.
+  certificate-hash set, and the session token. Hashes are public pins; the
+  session token is the only client secret.
 - **Recovery:** the saved enrol/identity link (public, user-controlled) is the
   anchor of last resort. Passkey `largeBlob`/`prf` are optional hardening.
 
-## Enrolment (SSH, once)
+## Enrolment (client-side, once)
 
-1. `ssh user@host quosh enrol` runs on the server as that user and prints an
-   enrolment link/QR: server address, the current forward certificate-hash
-   set, and a one-time nonce.
-2. The browser opens the link, connects over WebTransport using the pinned
-   hashes (still unauthenticated at the application layer), and receives a
-   server challenge.
-3. `navigator.credentials.create()` with RP `quosh.jtcs.dev` and
+`quosh enroll` is a **client** command, like `quosh user@host`. A server-local
+`quosh enroll` may be added later.
+
+1. On the client: `quosh enroll [--ssh=cmd] user@host`. It SSHs to the server,
+   which runs a hidden helper (like `create-session`) that asks the daemon for
+   a one-time enrolment nonce bound to the SSH-authenticated uid.
+2. The client formats the reply into a URL and QR code and prints them
+   locally; the browser on that machine opens the link.
+3. The URL is `<base_url>/e#enroll=<payload>`, payload
+   `{v, host, port, hash, nonce, user}`: the server address, the **currently
+   valid certificate hash only** (to keep the URL short), the nonce, and a
+   display name. The uid comes from the nonce, never the payload. The `/e`
+   path routes the PWA to the enrolment handler; the fragment is never sent to
+   the static host.
+4. The browser opens the link, connects over WebTransport using that pinned
+   hash (still unauthenticated at the application layer), and sends the nonce.
+5. The server validates the nonce (bound to the SSH uid, single-use, ~10 min
+   TTL), returns a challenge, and sends the forward certificate-hash set.
+6. `navigator.credentials.create()` with RP `quosh.jtcs.dev` and
    `user.name`/`user.id` per the naming rule.
-4. The page sends `credential_id` + public key to the server over that
-   channel. The server stores `{uid, credential_id, public_key, rp_id, origin,
-   sign_count}` durably and returns a device token plus the forward hash batch.
+7. The page sends `credential_id` + public key. The server stores
+   `{uid, credential_id, public_key, rp_id, origin, sign_count}` durably,
+   consumes the nonce, and returns a session token.
 
 ## Reconnect (no SSH)
 
-1. The browser reads the stored server address, hash set, and device token,
+1. The browser reads the stored server address, hash set, and session token,
    and opens WebTransport with the pinned hashes.
 2. The server sends a fresh challenge.
-3. A valid device token is accepted silently. Otherwise the page calls
-   `navigator.credentials.get()` with that server's `credential_id`; the server
-   verifies the signature, challenge, origin, and RP ID against the stored
-   registration, then issues or rotates the device token.
+3. A valid, unexpired session token is accepted silently and rotated.
+   Otherwise the page calls `navigator.credentials.get()` with that server's
+   `credential_id`; the server verifies the signature, challenge, origin, and
+   RP ID against the stored registration, then issues a new session token.
 4. The server resolves the Unix uid **from the stored registration, never from
    the network**, and attaches the user's session.
 
@@ -79,17 +93,148 @@ The server must validate the WebTransport request `Origin` is
 `https://quosh.jtcs.dev`, and every challenge must be server-generated per
 connection.
 
+## Session token lifetime
+
+- Issued after a successful passkey assertion, or handed off on a valid
+  reconnect.
+- **Sliding, activity-based:** the server tracks `last_seen` per token and
+  refreshes it on any session activity, in either direction — client input or
+  server screen updates. A long-running build, training job, or an `htop` left
+  open keeps the token alive. A reconnect with
+  `now - last_seen > 60 minutes` is rejected and falls back to the passkey.
+- **Rotated on every authenticated connect**; the previous value is
+  invalidated. A lost rotation response costs one passkey prompt, nothing more.
+- Stored in IndexedDB so a tab reload or short suspend reconnects silently;
+  never a cookie. Server-side revocation is immediate.
+- Activity in either direction extends the token by design: any live session,
+  even one that is only displaying output, stays connected without a passkey.
+
+## Session model
+
+- Each browser tab creates its **own** Quosh session and is independent; no
+  viewers, no takeover, one transport per session (the existing v1 rule).
+- A reconnect within a tab resumes that tab's session with its session token.
+- If the session token has lapsed, resuming that same session requires a
+  passkey.
+- Resumption is **tab-scoped**: the session id lives in the tab
+  (memory/sessionStorage), never in durable storage. A new tab or cold browser
+  session has no id and creates a new Quosh session. With
+  Sheepdog (later), a new Quosh session joins the user's single Sheepdog
+  session, so continuity comes from Sheepdog rather than Quosh-level
+  reattachment.
+
+## Revocation and recovery
+
+v1 includes device management, run **on the server** (never triggered from the
+PWA):
+
+- `quosh devices` — list this uid's registrations: short credential id,
+  `user.name`, created, last used; plus live session tokens.
+- `quosh revoke <credential-id>` — drop one registration and its tokens.
+- `quosh revoke --all` — drop every registration and token for the uid.
+- `quosh revoke --sessions` — drop only live session tokens (forces a passkey
+  on the next connect) without unregistering the device.
+
+These talk to the daemon over the Unix socket and are authenticated by
+`SO_PEERCRED`; they are not exposed to a passkey-authenticated network client.
+Registrations live under `/var/lib/quosh`. Losing a passkey is recovered by
+running `quosh enroll` again (a new registration), not by a special recovery
+flow.
+
+Difference from Mosh worth remembering: a Mosh credential is a per-session key
+that dies with the session, so Mosh needs no revocation. A Quosh passkey is
+durable, so a lost device stays authorized until its registration is removed.
+
+## Multi-server UX
+
+- The PWA always shows the enrolled-server list on open, even when it has only
+  one entry. Selecting an entry connects: silently with a valid session token,
+  otherwise a passkey prompt for that credential.
+- The list is one entry per `(user, server)`, added or updated by each
+  `quosh enroll` link.
+- **Forget** removes an entry from this browser only; it does not touch the
+  server registration (use `quosh revoke` on the server for that).
+- No extra metadata is shown beyond the display name.
+
+## PWA UX (mobile-first)
+
+- The PWA is designed for mobile; desktop is the easy case, not the target.
+- **Quit is a UI action**, not a keyboard escape. `Ctrl-^ .` is not usable on a
+  mobile keyboard and is not the PWA's quit affordance.
+- A mobile shell still needs modifiers, Esc/Tab, arrows, and paste, which a
+  phone keyboard does not provide; the PWA supplies them (see below).
+- **Key bar (v1).** A collapsible row above the OS keyboard:
+  - sticky **Ctrl** and **Alt** — tap to arm, applies to the next key, then
+    clears;
+  - **Esc**, **Tab**, and the four arrow keys;
+  - a second row of hard-to-reach characters: `| ~ / - \` and backtick;
+  - **Paste** and a **menu** (Copy, Quit, keyboard toggle).
+  - First pass; easy to extend as real use reveals gaps.
+- **Paste.** `navigator.clipboard.readText()` on an explicit user gesture,
+  delivered as a bracketed paste when the app has enabled it. If the API is
+  unavailable or permission is denied, fall back to a focused hidden textarea
+  and the OS paste gesture. Never read the clipboard without a user action.
+  Pastes larger than `PASTE_BYTES` reset prediction, as in the CLI.
+- **Copy.** `navigator.clipboard.writeText()` on an explicit gesture.
+
+## Renderer
+
+- **Timeboxed Blit spike: one focused day.** Drive the unmodified
+  `blit-browser` renderer from an arbitrary `blit-remote` `FrameState` with no
+  Blit connection/state/diff layer.
+- Success = a QS2 frame draws, with `quosh-predict` overlays applied first.
+- If it needs frontend/state patches, abandon and fall back to a thin canvas2D
+  renderer that reuses the `blit-remote` cell format; WebGL only if profiling
+  demands it.
+- No xterm.js.
+
+## PWA stack
+
+- Frontend: plain TypeScript + HTML/CSS, no framework — small and CSP-tight,
+  since the session token lives on this origin.
+- `quosh-predict-wasm`: thin `wasm-bindgen` binding around `quosh-predict`
+  exposing the same calls the CLI uses. `quosh-predict` stays transport- and
+  WASM-free.
+- Frame decode/render per the renderer decision; `blit-remote` cell format.
+- Build: `wasm-pack` plus `vite`/`esbuild`; static output.
+
+## Hosting and delivery
+
+- Hetzner object storage with nginx in front; the operator manages hosting,
+  TLS, CSP, and MIME. nginx serves `application/wasm` and sets the CSP.
+- v1 ships as a **website**; an installable PWA (manifest + service worker)
+  comes later.
+- CSP must let WebTransport reach arbitrary user servers (`connect-src`), and
+  must allow `wasm-unsafe-eval` for the WASM predictor. Exact header values are
+  the host's concern.
+
+## Server identity key lifecycle
+
+- One long-lived key under `/var/lib/quosh`; operators back it up.
+- Losing or rotating it invalidates every cached pin: every enrolled browser
+  must re-run `quosh enroll` over SSH. No export/import in v1.
+- The PWA should surface a distinct "server identity changed; re-enrol"
+  message when the cached pins match nothing, best-effort — browsers may not
+  cleanly distinguish a certificate mismatch from a network failure.
+
 ## Certificate chain
 
-- Cert `k` is self-signed with the long-lived identity key and a ≤14-day
-  validity window in a deterministic epoch sequence.
+- Chain length is a **server-side setting**: `quosh-server --cert-chain N`
+  (default **7**), server-wide. Clients never pass a count. The server
+  generates and persists the identity key at startup and issues/replenishes
+  the chain; `quosh enrol` hands out only the current certificate hash, and
+  the forward set follows over the connection once the nonce is accepted.
+- Cert `k` is self-signed with the long-lived identity key and covers
+  `[k·13d, k·13d + 14d)` — a 13-day stride with 14-day validity, so adjacent
+  certificates overlap by one day. Decided: **default N = 7**, giving ≈92 days
+  of coverage and a full day of clock-skew tolerance at every boundary.
 - The server presents the certificate whose window is current; the client
   passes the whole cached hash set and the browser accepts the match.
 - On each authenticated connection the server sends the next hashes so the
-  client's coverage extends to at least 98 days from now.
-- Adjacent windows should overlap by about a day to absorb clock skew.
+  client's coverage extends to at least N certificates' worth (≈92 days for the
+  default) from now.
 - If a browser has been offline longer than its cached coverage, it needs the
-  saved enrol link or SSH. With 7 certificates this is ~98 days.
+  saved enrol link or SSH. With the default 7 certificates this is ≈92 days.
 
 ## Client storage and secrets
 
@@ -97,10 +242,10 @@ connection.
 |---|---|---|
 | Certificate-hash set | No (public pin) | IndexedDB/localStorage; optional `largeBlob` |
 | Server address/port | No | IndexedDB/localStorage + recovery link |
-| Device token | Yes (bearer) | IndexedDB; never a cookie; long TTL; rotatable/revocable |
+| Session token | Yes (bearer) | IndexedDB; never a cookie; 60-min sliding idle; rotated per connect; revocable |
 | Passkey | Yes (authenticator) | OS / password manager |
 
-- Server-side revocation of a device token or a credential is the kill switch;
+- Server-side revocation of a session token or a credential is the kill switch;
   SSH re-enrolment is recovery of last resort.
 - Storage eviction (Safari ITP, "clear site data") loses the hash set; the
   recovery link restores it. Treat the hashes as a cache the server re-sends,
@@ -121,8 +266,7 @@ eviction, never as the primary anchor.
 
 ## Open questions
 
-- Device-token lifetime and rotation cadence.
-- Certificate epoch alignment and exact overlap policy.
-- Whether the browser attaches to a per-uid singleton session (Sheepdog) or
-  creates a session per connection.
-- The `blit-browser` renderer seam and WASM packaging of `quosh-predict`.
+- Verify how Chrome applies CSP `connect-src` to WebTransport.
+- Outcome of the Blit renderer spike; whether it needs COOP/COEP for
+  `SharedArrayBuffer`.
+- Slice 3 acceptance criteria are not yet written.
