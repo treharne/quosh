@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod cert;
 pub mod devices;
 pub mod enroll;

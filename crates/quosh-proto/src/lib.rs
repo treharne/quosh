@@ -170,6 +170,17 @@ pub const MSG_EXIT: u8 = 9;
 pub const MSG_ERROR: u8 = 10;
 pub const MSG_PING: u8 = 11;
 pub const MSG_PONG: u8 = 12;
+// Authentication handshake (slice 3). A browser sends `MSG_AUTH_HELLO` instead
+// of `MSG_HELLO` as the first frame; the CLI keeps sending `MSG_HELLO`.
+pub const MSG_AUTH_HELLO: u8 = 13;
+pub const MSG_CHALLENGE: u8 = 14;
+pub const MSG_ENROLL: u8 = 15;
+pub const MSG_ASSERT: u8 = 16;
+pub const MSG_AUTH_OK: u8 = 17;
+pub const MSG_AUTH_FAIL: u8 = 18;
+
+/// Upper bound on certificate hashes in one auth frame.
+pub const MAX_CHAIN_HASHES: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -790,6 +801,284 @@ pub struct EnrollPayload {
     pub user: String,
 }
 
+// -- Auth handshake payloads -------------------------------------------------
+//
+// Fixed-width fields where possible; variable-length fields use a `u16` length
+// prefix. These documents are tiny (a challenge, a COSE key, a signature), so
+// the simple encoding beats a generic one.
+
+/// Client's first frame in the auth path: an optional session token, the
+/// session to resume (all zeros to create a new one), and the initial size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthHello {
+    pub auth_token: [u8; 32],
+    pub session_id: [u8; 16],
+    pub session_token: [u8; 32],
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl AuthHello {
+    pub const LEN: usize = 32 + 16 + 32 + 2 + 2;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut p = Vec::with_capacity(Self::LEN);
+        p.extend_from_slice(&self.auth_token);
+        p.extend_from_slice(&self.session_id);
+        p.extend_from_slice(&self.session_token);
+        p.extend_from_slice(&self.cols.to_le_bytes());
+        p.extend_from_slice(&self.rows.to_le_bytes());
+        encode_frame(MSG_AUTH_HELLO, &p)
+    }
+
+    pub fn decode(p: &[u8]) -> Result<Self> {
+        if p.len() != Self::LEN {
+            return Err(Error::Frame);
+        }
+        Ok(Self {
+            auth_token: p[0..32].try_into().unwrap(),
+            session_id: p[32..48].try_into().unwrap(),
+            session_token: p[48..80].try_into().unwrap(),
+            cols: u16::from_le_bytes(p[80..82].try_into().unwrap()),
+            rows: u16::from_le_bytes(p[82..84].try_into().unwrap()),
+        })
+    }
+}
+
+fn put_n(out: &mut Vec<u8>, b: &[u8]) -> Result<()> {
+    if b.len() > u16::MAX as usize {
+        return Err(Error::TooLarge);
+    }
+    out.extend_from_slice(&(b.len() as u16).to_le_bytes());
+    out.extend_from_slice(b);
+    Ok(())
+}
+
+struct Reader<'a> {
+    p: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(p: &'a [u8]) -> Self {
+        Self { p, i: 0 }
+    }
+
+    fn u8(&mut self) -> Result<u8> {
+        let v = *self.p.get(self.i).ok_or(Error::Truncated)?;
+        self.i += 1;
+        Ok(v)
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let b = self.p.get(self.i..self.i + n).ok_or(Error::Truncated)?;
+        self.i += n;
+        Ok(b)
+    }
+
+    fn n(&mut self) -> Result<&'a [u8]> {
+        let n = u16::from_le_bytes(self.take(2)?.try_into().unwrap()) as usize;
+        self.take(n)
+    }
+
+    fn done(&self) -> Result<()> {
+        if self.i == self.p.len() {
+            Ok(())
+        } else {
+            Err(Error::Frame)
+        }
+    }
+}
+
+fn put_hashes(out: &mut Vec<u8>, hashes: &[[u8; 32]]) -> Result<()> {
+    if hashes.len() > MAX_CHAIN_HASHES {
+        return Err(Error::TooLarge);
+    }
+    out.push(hashes.len() as u8);
+    for h in hashes {
+        out.extend_from_slice(h);
+    }
+    Ok(())
+}
+
+fn take_hashes(c: &mut Reader) -> Result<Vec<[u8; 32]>> {
+    let n = c.u8()? as usize;
+    if n > MAX_CHAIN_HASHES {
+        return Err(Error::TooLarge);
+    }
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(c.take(32)?.try_into().unwrap());
+    }
+    Ok(out)
+}
+
+/// Server's challenge plus the RP ID and the forward certificate-hash set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Challenge {
+    pub challenge: [u8; 32],
+    pub rp_id: String,
+    pub hashes: Vec<[u8; 32]>,
+}
+
+impl Challenge {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        if self.rp_id.len() > u8::MAX as usize {
+            return Err(Error::TooLarge);
+        }
+        let mut p = Vec::new();
+        p.extend_from_slice(&self.challenge);
+        p.push(self.rp_id.len() as u8);
+        p.extend_from_slice(self.rp_id.as_bytes());
+        put_hashes(&mut p, &self.hashes)?;
+        Ok(encode_frame(MSG_CHALLENGE, &p))
+    }
+
+    pub fn decode(p: &[u8]) -> Result<Self> {
+        let mut c = Reader::new(p);
+        let challenge = c.take(32)?.try_into().unwrap();
+        let n = c.u8()? as usize;
+        let rp_id = std::str::from_utf8(c.take(n)?)
+            .map_err(|_| Error::Frame)?
+            .to_string();
+        let hashes = take_hashes(&mut c)?;
+        c.done()?;
+        Ok(Self {
+            challenge,
+            rp_id,
+            hashes,
+        })
+    }
+}
+
+/// Enrolment: the one-time nonce plus the WebAuthn registration result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Enroll {
+    pub nonce: [u8; 16],
+    pub client_data_json: Vec<u8>,
+    pub attestation_object: Vec<u8>,
+}
+
+impl Enroll {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&self.nonce);
+        put_n(&mut p, &self.client_data_json)?;
+        put_n(&mut p, &self.attestation_object)?;
+        Ok(encode_frame(MSG_ENROLL, &p))
+    }
+
+    pub fn decode(p: &[u8]) -> Result<Self> {
+        let mut c = Reader::new(p);
+        let nonce = c.take(16)?.try_into().unwrap();
+        let client_data_json = c.n()?.to_vec();
+        let attestation_object = c.n()?.to_vec();
+        c.done()?;
+        Ok(Self {
+            nonce,
+            client_data_json,
+            attestation_object,
+        })
+    }
+}
+
+/// A passkey assertion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assert {
+    pub credential_id: Vec<u8>,
+    pub authenticator_data: Vec<u8>,
+    pub client_data_json: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+impl Assert {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut p = Vec::new();
+        put_n(&mut p, &self.credential_id)?;
+        put_n(&mut p, &self.authenticator_data)?;
+        put_n(&mut p, &self.client_data_json)?;
+        put_n(&mut p, &self.signature)?;
+        Ok(encode_frame(MSG_ASSERT, &p))
+    }
+
+    pub fn decode(p: &[u8]) -> Result<Self> {
+        let mut c = Reader::new(p);
+        let credential_id = c.n()?.to_vec();
+        let authenticator_data = c.n()?.to_vec();
+        let client_data_json = c.n()?.to_vec();
+        let signature = c.n()?.to_vec();
+        c.done()?;
+        Ok(Self {
+            credential_id,
+            authenticator_data,
+            client_data_json,
+            signature,
+        })
+    }
+}
+
+/// Successful auth: rotated session token, uid, the Quosh session to use, and
+/// the certificate hashes to pin next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthOk {
+    pub auth_token: [u8; 32],
+    pub uid: u32,
+    pub session_id: [u8; 16],
+    pub session_token: [u8; 32],
+    pub hashes: Vec<[u8; 32]>,
+}
+
+impl AuthOk {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&self.auth_token);
+        p.extend_from_slice(&self.uid.to_le_bytes());
+        p.extend_from_slice(&self.session_id);
+        p.extend_from_slice(&self.session_token);
+        put_hashes(&mut p, &self.hashes)?;
+        Ok(encode_frame(MSG_AUTH_OK, &p))
+    }
+
+    pub fn decode(p: &[u8]) -> Result<Self> {
+        let mut c = Reader::new(p);
+        let auth_token = c.take(32)?.try_into().unwrap();
+        let uid = u32::from_le_bytes(c.take(4)?.try_into().unwrap());
+        let session_id = c.take(16)?.try_into().unwrap();
+        let session_token = c.take(32)?.try_into().unwrap();
+        let hashes = take_hashes(&mut c)?;
+        c.done()?;
+        Ok(Self {
+            auth_token,
+            uid,
+            session_id,
+            session_token,
+            hashes,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthFail {
+    pub reason: String,
+}
+
+impl AuthFail {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut p = Vec::new();
+        put_n(&mut p, self.reason.as_bytes())?;
+        Ok(encode_frame(MSG_AUTH_FAIL, &p))
+    }
+
+    pub fn decode(p: &[u8]) -> Result<Self> {
+        let mut c = Reader::new(p);
+        let reason = std::str::from_utf8(c.n()?)
+            .map_err(|_| Error::Frame)?
+            .to_string();
+        c.done()?;
+        Ok(Self { reason })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1027,5 +1316,75 @@ mod tests {
         let ansi = frame_ansi(&frame);
         let spaces = ansi.iter().filter(|&&b| b == b' ').count();
         assert_eq!(spaces, 4);
+    }
+
+    #[test]
+    fn auth_frames_round_trip() {
+        let split = |mut framed: Vec<u8>| {
+            let (typ, payload) = split_frame(&mut framed).unwrap().unwrap();
+            (typ, payload)
+        };
+
+        let hello = AuthHello {
+            auth_token: [1; 32],
+            session_id: [2; 16],
+            session_token: [3; 32],
+            cols: 100,
+            rows: 40,
+        };
+        let (typ, p) = split(hello.encode());
+        assert_eq!(typ, MSG_AUTH_HELLO);
+        assert_eq!(AuthHello::decode(&p).unwrap(), hello);
+        assert!(AuthHello::decode(&p[..p.len() - 1]).is_err());
+
+        let challenge = Challenge {
+            challenge: [4; 32],
+            rp_id: "quosh.jtcs.dev".into(),
+            hashes: vec![[5; 32], [6; 32]],
+        };
+        let (typ, p) = split(challenge.encode().unwrap());
+        assert_eq!(typ, MSG_CHALLENGE);
+        assert_eq!(Challenge::decode(&p).unwrap(), challenge);
+
+        let enroll = Enroll {
+            nonce: [7; 16],
+            client_data_json: b"{}".to_vec(),
+            attestation_object: vec![0xa0],
+        };
+        let (typ, p) = split(enroll.encode().unwrap());
+        assert_eq!(typ, MSG_ENROLL);
+        assert_eq!(Enroll::decode(&p).unwrap(), enroll);
+
+        let assert = Assert {
+            credential_id: vec![1, 2, 3],
+            authenticator_data: vec![4; 37],
+            client_data_json: b"{\"type\":\"webauthn.get\"}".to_vec(),
+            signature: vec![9; 72],
+        };
+        let (typ, p) = split(assert.encode().unwrap());
+        assert_eq!(typ, MSG_ASSERT);
+        assert_eq!(Assert::decode(&p).unwrap(), assert);
+        // Trailing bytes are rejected.
+        let mut extra = p.clone();
+        extra.push(0);
+        assert!(Assert::decode(&extra).is_err());
+
+        let ok = AuthOk {
+            auth_token: [8; 32],
+            uid: 1001,
+            session_id: [9; 16],
+            session_token: [10; 32],
+            hashes: vec![[11; 32]],
+        };
+        let (typ, p) = split(ok.encode().unwrap());
+        assert_eq!(typ, MSG_AUTH_OK);
+        assert_eq!(AuthOk::decode(&p).unwrap(), ok);
+
+        let fail = AuthFail {
+            reason: "nope".into(),
+        };
+        let (typ, p) = split(fail.encode().unwrap());
+        assert_eq!(typ, MSG_AUTH_FAIL);
+        assert_eq!(AuthFail::decode(&p).unwrap(), fail);
     }
 }

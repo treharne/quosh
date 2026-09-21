@@ -175,6 +175,37 @@ impl Daemon {
         idle
     }
 
+    /// Create a session subject to the global and per-uid limits. Shared by
+    /// the SSH helper and the browser auth handshake.
+    pub(crate) async fn spawn_session(
+        &self,
+        uid: u32,
+        cols: u16,
+        rows: u16,
+    ) -> std::result::Result<([u8; 16], [u8; 32]), String> {
+        let (cols, rows) = validate_dims(cols, rows).map_err(str::to_string)?;
+        let mut id = [0u8; 16];
+        let mut token = [0u8; 32];
+        rand::rng().fill_bytes(&mut id);
+        rand::rng().fill_bytes(&mut token);
+        let mut g = self.sessions.lock().await;
+        if g.len() >= MAX_SESSIONS {
+            return Err("too many sessions".into());
+        }
+        if g.values().filter(|s| s.uid == uid).count() >= MAX_PER_UID {
+            return Err("too many sessions for user".into());
+        }
+        match spawn_pair(id, token, uid, cols, rows) {
+            Ok((sess, owner)) => {
+                g.insert(id, sess.clone());
+                drop(g);
+                sess.start(self.sessions.clone(), owner);
+                Ok((id, token))
+            }
+            Err(e) => Err(format!("{e:#}")),
+        }
+    }
+
     async fn create(
         &self,
         uid: u32,
@@ -183,50 +214,37 @@ impl Daemon {
     ) -> HelperResponse {
         let cols = if req.cols == 0 { 80 } else { req.cols };
         let rows = if req.rows == 0 { 24 } else { req.rows };
-        if let Err(e) = validate_dims(cols, rows) {
-            return fail(e);
-        }
+        // Collect (and optionally kill) idle sessions first, so a user at the
+        // limit can replace one by reconnecting.
         let mut idle = Vec::new();
-        let mut id = [0u8; 16];
-        let mut token = [0u8; 32];
-        rand::rng().fill_bytes(&mut id);
-        rand::rng().fill_bytes(&mut token);
-
-        let mut g = self.sessions.lock().await;
-        let mut drop_ids = Vec::new();
-        for (sid, s) in g.iter() {
-            if s.uid != uid {
-                continue;
+        {
+            let mut g = self.sessions.lock().await;
+            let mut drop_ids = Vec::new();
+            for (sid, s) in g.iter() {
+                if s.uid != uid {
+                    continue;
+                }
+                if let Some(secs) = s.detached_secs().await
+                    && secs >= IDLE_SECS
+                {
+                    idle.push(IdleInfo {
+                        id: hex::encode(sid),
+                        idle_secs: secs,
+                    });
+                    if req.kill_idle {
+                        drop_ids.push(*sid);
+                    }
+                }
             }
-            if let Some(secs) = s.detached_secs().await
-                && secs >= IDLE_SECS
-            {
-                idle.push(IdleInfo {
-                    id: hex::encode(sid),
-                    idle_secs: secs,
-                });
-                if req.kill_idle {
-                    drop_ids.push(*sid);
+            for sid in drop_ids {
+                if let Some(s) = g.remove(&sid) {
+                    s.request_hangup();
+                    info!("killed idle session {}", hex::encode(sid));
                 }
             }
         }
-        for sid in drop_ids {
-            if let Some(s) = g.remove(&sid) {
-                s.request_hangup();
-                info!("killed idle session {}", hex::encode(sid));
-            }
-        }
-        if g.len() >= MAX_SESSIONS {
-            return fail("too many sessions");
-        }
-        if g.values().filter(|s| s.uid == uid).count() >= MAX_PER_UID {
-            return fail("too many sessions for user");
-        }
-        match spawn_pair(id, token, uid, cols, rows) {
-            Ok((sess, owner)) => {
-                g.insert(id, sess.clone());
-                drop(g);
-                sess.start(self.sessions.clone(), owner);
+        match self.spawn_session(uid, cols, rows).await {
+            Ok((id, token)) => {
                 info!("session {} uid {uid} {}x{}", hex::encode(id), cols, rows);
                 resp.session_id = Some(hex::encode(id));
                 resp.token = Some(hex::encode(token));
@@ -234,7 +252,7 @@ impl Daemon {
                 resp
             }
             Err(e) => {
-                let mut r = fail(format!("{e:#}"));
+                let mut r = fail(e);
                 r.idle = idle;
                 r
             }
@@ -252,7 +270,7 @@ fn fail(msg: impl Into<String>) -> HelperResponse {
 
 /// Work out the display name `<unix_user>@<server>` uses. Only the user part
 /// comes from the server; the browser knows the address.
-fn unix_name(uid: u32) -> Option<String> {
+pub(crate) fn unix_name(uid: u32) -> Option<String> {
     nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
         .ok()
         .flatten()

@@ -33,8 +33,9 @@ certificate without restarts — is implemented in
 server-side auth core is also implemented: WebAuthn registration/assertion
 verification, durable device registrations with sliding session tokens,
 one-time enrolment nonces, the `enroll-nonce`/`devices`/`revoke` helper ops,
-and `quosh enroll` / `quosh devices` / `quosh revoke`. Next: the WebTransport
-auth handshake, then WASM bindings and the PWA.
+and `quosh enroll` / `quosh devices` / `quosh revoke`. The WebTransport auth
+handshake (enrolment / assertion / token) is wired into the control stream.
+Next: WASM bindings and the PWA.
 
 ## Later
 

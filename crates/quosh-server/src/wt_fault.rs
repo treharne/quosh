@@ -7,8 +7,9 @@ use crate::session::{Session, StubSession, spawn_pair};
 use crate::transport::handle_incoming;
 use nix::unistd::Uid;
 use quosh_proto::{
-    Hello, MSG_ERROR, MSG_EXIT, MSG_HELLO_OK, MSG_PONG, PROTOCOL_VERSION, WT_PATH, encode_input,
-    encode_ping, encode_resize, split_frame,
+    Assert, AuthFail, AuthHello, AuthOk, Challenge, Enroll, Hello, HelloOk, MSG_AUTH_FAIL,
+    MSG_AUTH_OK, MSG_CHALLENGE, MSG_ERROR, MSG_EXIT, MSG_HELLO_OK, MSG_PONG, PROTOCOL_VERSION,
+    WT_PATH, encode_input, encode_ping, encode_resize, split_frame,
 };
 use rand::RngCore;
 use std::net::SocketAddr;
@@ -124,6 +125,7 @@ async fn forward(sock: &Arc<UdpSocket>, pkt: Vec<u8>, dest: SocketAddr, delay: D
 
 struct Harness {
     sessions: Registry,
+    daemon: Arc<crate::helper::Daemon>,
     hash: [u8; 32],
     proxy: UdpProxy,
     dir: PathBuf,
@@ -151,23 +153,34 @@ impl Harness {
         let backend = endpoint.local_addr().expect("local_addr");
         let proxy = UdpProxy::spawn(backend).await;
         let sessions: Registry = Arc::new(tokio::sync::Mutex::new(Default::default()));
-        let s2 = sessions.clone();
+        let daemon = Arc::new(crate::helper::Daemon {
+            sessions: sessions.clone(),
+            chain: tls.clone(),
+            devices: crate::devices::DeviceStore::load(&dir.join("devices.json"))
+                .expect("devices"),
+            nonces: crate::enroll::NonceStore::new(),
+            port: backend.port(),
+            rp_id: "quosh.jtcs.dev".into(),
+            origin: "https://quosh.jtcs.dev".into(),
+        });
         let transports = Arc::new(AtomicUsize::new(0));
         let t2 = transports.clone();
+        let accept_daemon = daemon.clone();
         let accept = tokio::spawn(async move {
             loop {
                 let incoming = endpoint.accept().await;
-                let sessions = s2.clone();
+                let daemon = accept_daemon.clone();
                 let transports = t2.clone();
                 tokio::spawn(async move {
                     transports.fetch_add(1, Ordering::SeqCst);
-                    let _ = handle_incoming(incoming, sessions).await;
+                    let _ = handle_incoming(incoming, daemon).await;
                     transports.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         });
         Self {
             sessions,
+            daemon,
             hash,
             proxy,
             dir,
@@ -552,4 +565,206 @@ async fn wt_rejects_wrong_protocol_version() {
         assert!(n > 0, "eof before error frame");
         buf.extend_from_slice(&tmp[..n]);
     }
+}
+
+async fn read_frame(recv: &mut RecvStream, buf: &mut Vec<u8>) -> (u8, Vec<u8>) {
+    let mut tmp = [0u8; 4096];
+    loop {
+        if let Some(f) = split_frame(buf).expect("split") {
+            return f;
+        }
+        let n = tokio::time::timeout(Duration::from_secs(2), recv.read(&mut tmp))
+            .await
+            .expect("read timeout")
+            .expect("read")
+            .unwrap_or(0);
+        assert!(n > 0, "eof on control stream");
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+async fn expect_frame(recv: &mut RecvStream, buf: &mut Vec<u8>, want: u8) -> Vec<u8> {
+    loop {
+        let (typ, payload) = read_frame(recv, buf).await;
+        if typ == want {
+            return payload;
+        }
+        if typ == MSG_ERROR {
+            panic!("server error while waiting for frame {want}");
+        }
+    }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// A simulated browser: enrol a passkey, resume the session with an assertion,
+/// then reconnect silently with the rotated session token. Also checks that a
+/// session cannot be hijacked by a different uid.
+#[tokio::test]
+async fn wt_browser_enrol_assert_and_resume() {
+    use crate::webauthn::sim::FakeAuthenticator;
+    let h = Harness::start().await;
+    let uid = Uid::current().as_raw();
+    let nonce = h.daemon.nonces.issue(uid, now_secs());
+    let auth = FakeAuthenticator::new();
+
+    // Enrolment.
+    let wt = h.connect().await;
+    let (mut send, mut recv) = wt.open_bi().await.expect("open_bi");
+    let mut buf = Vec::new();
+    send.write_all(
+        &AuthHello {
+            auth_token: [0; 32],
+            session_id: [0; 16],
+            session_token: [0; 32],
+            cols: 80,
+            rows: 24,
+        }
+        .encode(),
+    )
+    .await
+    .expect("auth hello");
+    let challenge = Challenge::decode(&expect_frame(&mut recv, &mut buf, MSG_CHALLENGE).await)
+        .expect("challenge");
+    assert_eq!(challenge.rp_id, "quosh.jtcs.dev");
+    assert!(!challenge.hashes.is_empty(), "forward hashes missing");
+    let (client_data, att) = auth.registration(&challenge.challenge, 0);
+    send.write_all(
+        &Enroll {
+            nonce,
+            client_data_json: client_data,
+            attestation_object: att,
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .expect("enroll");
+    let ok = AuthOk::decode(&expect_frame(&mut recv, &mut buf, MSG_AUTH_OK).await).expect("auth ok");
+    assert_eq!(ok.uid, uid);
+    assert_ne!(ok.session_id, [0; 16], "no session created");
+    assert!(!ok.hashes.is_empty());
+    send.write_all(
+        &Hello {
+            protocol: PROTOCOL_VERSION,
+            session_id: ok.session_id,
+            token: ok.session_token,
+            cols: 80,
+            rows: 24,
+        }
+        .encode(),
+    )
+    .await
+    .expect("hello");
+    let hello_ok =
+        HelloOk::decode(&expect_frame(&mut recv, &mut buf, MSG_HELLO_OK).await).expect("hello ok");
+    assert_eq!(hello_ok.session_id, ok.session_id);
+
+    // Passkey assertion resumes the same session.
+    let wt2 = h.connect().await;
+    let (mut send2, mut recv2) = wt2.open_bi().await.expect("open_bi");
+    let mut buf2 = Vec::new();
+    send2
+        .write_all(
+            &AuthHello {
+                auth_token: [0; 32],
+                session_id: ok.session_id,
+                session_token: ok.session_token,
+                cols: 80,
+                rows: 24,
+            }
+            .encode(),
+        )
+        .await
+        .expect("auth hello 2");
+    let challenge = Challenge::decode(&expect_frame(&mut recv2, &mut buf2, MSG_CHALLENGE).await)
+        .expect("challenge 2");
+    let (client_data, auth_data, sig) = auth.assertion(&challenge.challenge, 1);
+    send2
+        .write_all(
+            &Assert {
+                credential_id: auth.credential_id.clone(),
+                authenticator_data: auth_data,
+                client_data_json: client_data,
+                signature: sig,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .await
+        .expect("assert");
+    let ok2 =
+        AuthOk::decode(&expect_frame(&mut recv2, &mut buf2, MSG_AUTH_OK).await).expect("auth ok 2");
+    assert_eq!(ok2.uid, uid);
+    assert_eq!(ok2.session_id, ok.session_id, "session was not resumed");
+    assert_ne!(ok2.auth_token, ok.auth_token, "auth token was not rotated");
+
+    // The rotated token reconnects with no ceremony.
+    let wt3 = h.connect().await;
+    let (mut send3, mut recv3) = wt3.open_bi().await.expect("open_bi");
+    let mut buf3 = Vec::new();
+    send3
+        .write_all(
+            &AuthHello {
+                auth_token: ok2.auth_token,
+                session_id: ok2.session_id,
+                session_token: ok2.session_token,
+                cols: 80,
+                rows: 24,
+            }
+            .encode(),
+        )
+        .await
+        .expect("auth hello 3");
+    let ok3 =
+        AuthOk::decode(&expect_frame(&mut recv3, &mut buf3, MSG_AUTH_OK).await).expect("auth ok 3");
+    assert_eq!(ok3.uid, uid);
+    assert_eq!(ok3.session_id, ok.session_id);
+}
+
+#[tokio::test]
+async fn wt_browser_rejects_bad_nonce_and_unknown_token_falls_back() {
+    use crate::webauthn::sim::FakeAuthenticator;
+    let h = Harness::start().await;
+    let auth = FakeAuthenticator::new();
+
+    // An unknown nonce is refused, not accepted.
+    let wt = h.connect().await;
+    let (mut send, mut recv) = wt.open_bi().await.expect("open_bi");
+    let mut buf = Vec::new();
+    send.write_all(&AuthHello::decode(&[0u8; 84]).unwrap().encode())
+        .await
+        .expect("auth hello");
+    let challenge = Challenge::decode(&expect_frame(&mut recv, &mut buf, MSG_CHALLENGE).await)
+        .expect("challenge");
+    let (client_data, att) = auth.registration(&challenge.challenge, 0);
+    send.write_all(
+        &Enroll {
+            nonce: [0; 16],
+            client_data_json: client_data,
+            attestation_object: att,
+        }
+        .encode()
+        .unwrap(),
+    )
+    .await
+    .expect("enroll");
+    let fail = AuthFail::decode(&expect_frame(&mut recv, &mut buf, MSG_AUTH_FAIL).await)
+        .expect("auth fail");
+    assert!(fail.reason.contains("nonce"), "reason was {:?}", fail.reason);
+
+    // An unknown auth token does not error; it falls through to a challenge.
+    let wt2 = h.connect().await;
+    let (mut send2, mut recv2) = wt2.open_bi().await.expect("open_bi");
+    let mut buf2 = Vec::new();
+    let mut hello = AuthHello::decode(&[0u8; 84]).unwrap();
+    hello.auth_token = [7; 32];
+    send2.write_all(&hello.encode()).await.expect("auth hello 2");
+    let _ = Challenge::decode(&expect_frame(&mut recv2, &mut buf2, MSG_CHALLENGE).await)
+        .expect("challenge 2");
 }

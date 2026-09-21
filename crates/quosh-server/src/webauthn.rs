@@ -378,22 +378,24 @@ fn read_cbor(buf: &[u8]) -> Result<(Cbor, &[u8])> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod sim {
+    //! A software authenticator + the tiny CBOR writer it needs, shared by
+    //! the unit tests here and the transport handshake test.
     use super::*;
     use ring::rand::SystemRandom;
-    use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
+    use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING, KeyPair};
 
-    const RP: &str = "quosh.jtcs.dev";
-    const ORIGIN: &str = "https://quosh.jtcs.dev";
+    pub(crate) const RP: &str = "quosh.jtcs.dev";
+    pub(crate) const ORIGIN: &str = "https://quosh.jtcs.dev";
 
-    struct FakeAuthenticator {
-        key: EcdsaKeyPair,
-        credential_id: Vec<u8>,
-        rng: SystemRandom,
+    pub(crate) struct FakeAuthenticator {
+        pub(crate) key: EcdsaKeyPair,
+        pub(crate) credential_id: Vec<u8>,
+        pub(crate) rng: SystemRandom,
     }
 
     impl FakeAuthenticator {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let rng = SystemRandom::new();
             let pkcs8 =
                 EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
@@ -408,7 +410,7 @@ mod tests {
         }
 
         /// The uncompressed point, as it comes out of the authenticator.
-        fn point(&self) -> Vec<u8> {
+        pub(crate) fn point(&self) -> Vec<u8> {
             self.key.public_key().as_ref().to_vec()
         }
 
@@ -423,7 +425,7 @@ mod tests {
             ])
         }
 
-        fn registration(&self, challenge: &[u8], sign_count: u32) -> (Vec<u8>, Vec<u8>) {
+        pub(crate) fn registration(&self, challenge: &[u8], sign_count: u32) -> (Vec<u8>, Vec<u8>) {
             let client = client_json("webauthn.create", challenge);
             let auth_data = reg_auth_data(self.credential_id.clone(), &self.cose(), sign_count);
             let att = cbor_map(&[
@@ -434,7 +436,7 @@ mod tests {
             (client, att)
         }
 
-        fn assertion(&self, challenge: &[u8], sign_count: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        pub(crate) fn assertion(&self, challenge: &[u8], sign_count: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
             let client = client_json("webauthn.get", challenge);
             let mut auth_data = Vec::new();
             auth_data.extend_from_slice(&Sha256::digest(RP.as_bytes()));
@@ -447,7 +449,7 @@ mod tests {
         }
     }
 
-    fn client_json(typ: &str, challenge: &[u8]) -> Vec<u8> {
+    pub(crate) fn client_json(typ: &str, challenge: &[u8]) -> Vec<u8> {
         format!(
             r#"{{"type":"{typ}","challenge":"{}","origin":"{ORIGIN}"}}"#,
             URL_SAFE_NO_PAD.encode(challenge)
@@ -513,6 +515,13 @@ mod tests {
         }
         v
     }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sim::*;
+    use super::*;
 
     #[test]
     fn registration_round_trip() {

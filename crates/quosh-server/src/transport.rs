@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use quosh_proto::{
-    FrameFeed, Hello, HelloOk, MAX_FRAME, MAX_INPUT_BYTES, MSG_ACK_STATE, MSG_HANGUP, MSG_HELLO,
-    MSG_INPUT, MSG_PING, MSG_RESIZE, PROTOCOL_VERSION, WT_PATH, decode_input, decode_resize,
-    decode_u64, encode_error, encode_exit, encode_frame, encode_input_ack, encode_pong, peek_len,
-    split_frame,
+    FrameFeed, Hello, HelloOk, MAX_FRAME, MAX_INPUT_BYTES, MSG_ACK_STATE, MSG_AUTH_HELLO,
+    MSG_HANGUP, MSG_HELLO, MSG_INPUT, MSG_PING, MSG_RESIZE, PROTOCOL_VERSION, WT_PATH,
+    decode_input, decode_resize, decode_u64, encode_error, encode_exit, encode_frame,
+    encode_input_ack, encode_pong, peek_len, split_frame,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 use wtransport::endpoint::IncomingSession;
 
-use crate::helper::Registry;
+use crate::helper::Daemon;
 use crate::session::{Latest, QueueResult, Session};
 
 pub(crate) const BUSY_CAP: usize = 256 * 1024;
@@ -35,7 +35,25 @@ async fn reject(send: &mut wtransport::SendStream, code: u16, msg: &str) -> anyh
     anyhow::anyhow!("{msg}")
 }
 
-pub async fn handle_incoming(incoming: IncomingSession, sessions: Registry) -> Result<()> {
+/// Read one framed message, pulling more bytes as needed.
+async fn next_frame(
+    recv: &mut wtransport::RecvStream,
+    buf: &mut Vec<u8>,
+) -> Result<(u8, Vec<u8>)> {
+    loop {
+        if let Some(f) = split_frame(buf)? {
+            return Ok(f);
+        }
+        let mut tmp = [0u8; 4096];
+        let n = recv.read(&mut tmp).await?.context("eof before hello")?;
+        if n == 0 {
+            bail!("eof before hello");
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+pub async fn handle_incoming(incoming: IncomingSession, daemon: Arc<Daemon>) -> Result<()> {
     let req = incoming.await.context("incoming WT")?;
     let path = req.path().to_string();
     if path != WT_PATH && path != "/" {
@@ -45,39 +63,43 @@ pub async fn handle_incoming(incoming: IncomingSession, sessions: Registry) -> R
     let conn = req.accept().await.context("accept WT")?;
     let (mut send, mut recv) = conn.accept_bi().await.context("control stream")?;
 
+    // The first frame is either the CLI's `Hello` or, for a browser, the auth
+    // handshake followed by `Hello`.
     let mut buf = Vec::new();
-    let hello = loop {
-        let mut tmp = [0u8; 2048];
-        let n = recv.read(&mut tmp).await?.context("eof before hello")?;
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some((typ, payload)) = split_frame(&mut buf)? {
-            if typ != MSG_HELLO {
-                return Err(reject(&mut send, 1, "expected hello").await);
-            }
-            match Hello::decode(&payload) {
-                Ok(hello) if hello.protocol == PROTOCOL_VERSION => break hello,
-                Ok(hello) => {
-                    let msg = format!(
-                        "protocol version {} != {PROTOCOL_VERSION}; update quosh-server",
-                        hello.protocol
-                    );
-                    return Err(reject(&mut send, 4, &msg).await);
-                }
-                Err(_) => {
-                    // A client speaking an older layout: try to say so before
-                    // dropping, since it will otherwise just see a closed
-                    // stream.
-                    return Err(reject(
-                        &mut send,
-                        4,
-                        "protocol version mismatch; update quosh-server",
-                    )
-                    .await);
-                }
-            }
+    let (mut typ, mut payload) = next_frame(&mut recv, &mut buf).await?;
+    let mut auth_uid = None;
+    if typ == MSG_AUTH_HELLO {
+        let authed = crate::auth::run(&mut send, &mut recv, &mut buf, &daemon, &payload).await?;
+        auth_uid = Some(authed.uid);
+        let (t, p) = next_frame(&mut recv, &mut buf).await?;
+        typ = t;
+        payload = p;
+    }
+    if typ != MSG_HELLO {
+        return Err(reject(&mut send, 1, "expected hello").await);
+    }
+    let hello = match Hello::decode(&payload) {
+        Ok(hello) if hello.protocol == PROTOCOL_VERSION => hello,
+        Ok(hello) => {
+            let msg = format!(
+                "protocol version {} != {PROTOCOL_VERSION}; update quosh-server",
+                hello.protocol
+            );
+            return Err(reject(&mut send, 4, &msg).await);
+        }
+        Err(_) => {
+            // A client speaking an older layout: try to say so before
+            // dropping, since it will otherwise just see a closed stream.
+            return Err(reject(
+                &mut send,
+                4,
+                "protocol version mismatch; update quosh-server",
+            )
+            .await);
         }
     };
 
+    let sessions = daemon.sessions.clone();
     let sess = {
         let g = sessions.lock().await;
         g.get(&hello.session_id).cloned()
@@ -87,6 +109,11 @@ pub async fn handle_incoming(incoming: IncomingSession, sessions: Registry) -> R
     };
     if sess.token != hello.token {
         return Err(reject(&mut send, 3, "bad token").await);
+    }
+    if let Some(uid) = auth_uid
+        && sess.uid != uid
+    {
+        return Err(reject(&mut send, 5, "session does not belong to authenticated user").await);
     }
 
     let pending_hello_size = if hello.cols > 0 && hello.rows > 0 {

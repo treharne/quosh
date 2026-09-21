@@ -98,9 +98,9 @@ async fn main() -> Result<()> {
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
             incoming = endpoint.accept() => {
-                let sessions = daemon.sessions.clone();
+                let daemon = daemon.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_incoming(incoming, sessions).await {
+                    if let Err(e) = handle_incoming(incoming, daemon).await {
                         warn!("session: {e:#}");
                     }
                 });

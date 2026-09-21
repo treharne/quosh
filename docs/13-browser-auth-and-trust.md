@@ -1,12 +1,12 @@
 # Browser authentication and server trust (slice 3)
 
 Status: agreed design, partly implemented. The server trust foundation (see
-"Certificate chain" below) and the server-side auth core — WebAuthn
-verification, durable device registrations, one-time enrolment nonces, and the
-`quosh enroll` / `quosh devices` / `quosh revoke` commands — are implemented.
-The WebTransport auth handshake and the browser/PWA are not. Where this
-conflicts with the one-line PWA note in [v1 spec](11-v1-spec.md), this document
-wins.
+"Certificate chain" below), the server-side auth core — WebAuthn verification,
+durable device registrations, one-time enrolment nonces, the
+`quosh enroll` / `quosh devices` / `quosh revoke` commands — and the
+WebTransport auth handshake are implemented. The WASM bindings and the
+browser/PWA are not. Where this conflicts with the one-line PWA note in
+[v1 spec](11-v1-spec.md), this document wins.
 
 ## Goal
 
@@ -64,9 +64,22 @@ user presence + verification, challenge/origin/RP-ID checked); durable
 device registrations and sliding session tokens
 (`crates/quosh-server/src/devices.rs`); one-time nonces
 (`crates/quosh-server/src/enroll.rs`); the `enroll-nonce` / `devices` / `revoke`
-helper ops; and the client `quosh enroll` link builder plus server-side
-`quosh devices` / `quosh revoke`. The steps below that run over a WebTransport
-connection (3 onward) are not wired yet.
+helper ops; the client `quosh enroll` link builder plus server-side
+`quosh devices` / `quosh revoke`; and the WebTransport handshake
+(`crates/quosh-server/src/auth.rs`). The WASM bindings and the browser/PWA
+remain.
+
+On the wire, a browser sends `MSG_AUTH_HELLO` (auth token, session id/token,
+size) as the first control frame instead of `MSG_HELLO`. A live auth token is
+rotated and answered with `MSG_AUTH_OK` directly; otherwise the server sends
+`MSG_CHALLENGE` (challenge, RP ID, forward hashes) and the browser replies
+`MSG_ASSERT` or `MSG_ENROLL`. `MSG_AUTH_OK` carries the rotated auth token, the
+uid, the Quosh session to use (created if the client sent a zero session id,
+otherwise resumed only if it belongs to the uid), and the forward hashes. The
+client then sends the ordinary `MSG_HELLO`, so the transport below is
+unchanged. `MSG_AUTH_FAIL` reports a rejected ceremony. Only `MSG_HELLO`
+(the CLI path) and `MSG_AUTH_HELLO` are accepted as the first frame, so
+`PROTOCOL_VERSION` is unchanged.
 
 `quosh enroll` is a **client** command, like `quosh user@host`. A server-local
 `quosh enroll` may be added later.

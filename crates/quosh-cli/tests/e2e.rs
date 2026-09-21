@@ -177,13 +177,12 @@ impl Stack {
                 d.serve_unix(listener).await;
             }
         });
-        let s2 = sessions.clone();
         let accept = tokio::spawn(async move {
             loop {
                 let incoming = endpoint.accept().await;
-                let sessions = s2.clone();
+                let daemon = daemon.clone();
                 tokio::spawn(async move {
-                    let _ = handle_incoming(incoming, sessions).await;
+                    let _ = handle_incoming(incoming, daemon).await;
                 });
             }
         });
