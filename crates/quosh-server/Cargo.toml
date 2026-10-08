@@ -16,7 +16,8 @@ clap.workspace = true
 hex.workspace = true
 rand.workspace = true
 blit-remote.workspace = true
-alacritty_terminal = { package = "blit-alacritty-terminal", version = "=0.26.0-blit.1" }
+quosh-terminal.workspace = true
+quosh-pty.workspace = true
 nix = { version = "0.30", features = ["term", "user", "fs", "process", "socket", "hostname", "signal"] }
 libc = "0.2"
 wtransport = "0.6"

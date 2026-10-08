@@ -1,0 +1,10 @@
+[package]
+name = "quosh-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+libc = "0.2"
+nix = { version = "0.30", features = ["term", "fs"] }

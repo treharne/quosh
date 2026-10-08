@@ -1324,18 +1324,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "quosh-pty"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "nix",
+]
+
+[[package]]
 name = "quosh-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
- "blit-alacritty-terminal",
  "blit-remote",
  "clap",
  "hex",
  "libc",
  "nix",
  "quosh-proto",
+ "quosh-pty",
+ "quosh-terminal",
  "rand 0.9.5",
  "rcgen",
  "ring",
@@ -1351,6 +1361,14 @@ dependencies = [
  "url",
  "web-transport-quinn",
  "wtransport",
+]
+
+[[package]]
+name = "quosh-terminal"
+version = "0.1.0"
+dependencies = [
+ "blit-alacritty-terminal",
+ "blit-remote",
 ]
 
 [[package]]

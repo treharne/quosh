@@ -32,6 +32,16 @@ Canonical spec: [docs/11-v1-spec.md](docs/11-v1-spec.md).
 - PWA origin will be `https://quosh.jtcs.dev`. Not built yet.
 - Unmodified `blit-alacritty` for VT parsing; Quosh owns transport, sessions, and (later) prediction.
 
+## Reusable server components
+
+- `quosh-terminal`: terminal emulator and authoritative screen snapshots,
+  independent of the daemon and network transport.
+- `quosh-pty`: Linux PTY creation and descriptor duplication with atomic
+  close-on-exec protection.
+
+The server retains compatibility exports in `term` and `pty`; the CLI wire
+protocol is unchanged. Sheepdog consumes these libraries directly.
+
 ## Build
 
 ```bash

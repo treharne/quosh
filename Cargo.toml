@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/quosh-proto", "crates/quosh-predict", "crates/quosh-client", "crates/quosh-proto-wasm", "crates/quosh-predict-wasm", "crates/quosh-client-wasm", "crates/quosh-server", "crates/quosh-cli"]
+members = ["crates/quosh-proto", "crates/quosh-predict", "crates/quosh-client", "crates/quosh-proto-wasm", "crates/quosh-predict-wasm", "crates/quosh-client-wasm", "crates/quosh-server", "crates/quosh-cli", "crates/quosh-terminal", "crates/quosh-pty"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,8 @@ repository = "https://github.com/jt/quosh"
 quosh-proto = { path = "crates/quosh-proto" }
 quosh-predict = { path = "crates/quosh-predict" }
 quosh-client = { path = "crates/quosh-client" }
+quosh-terminal = { path = "crates/quosh-terminal" }
+quosh-pty = { path = "crates/quosh-pty" }
 quosh-proto-wasm = { path = "crates/quosh-proto-wasm" }
 quosh-predict-wasm = { path = "crates/quosh-predict-wasm" }
 quosh-client-wasm = { path = "crates/quosh-client-wasm" }
