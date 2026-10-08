@@ -6,7 +6,7 @@ Sheepdog has one authoritative terminal with independently sequenced client atta
 
 `MSG_SHARED_SCREEN = 19` is an additive message alongside ordinary `MSG_SCREEN`. Its payload consists of:
 
-- `QP1\0` (four-byte magic);
+- `QP1!` (four-byte magic; cannot collide with a valid QS2 decompression-size prefix);
 - prediction epoch (`u64`, little-endian);
 - prediction permitted (`u8`, exactly 0 or 1);
 - an ordinary compressed QS2 screen, including version and echo acknowledgment.

@@ -180,7 +180,9 @@ pub const MSG_AUTH_OK: u8 = 17;
 pub const MSG_AUTH_FAIL: u8 = 18;
 /// Screen plus prediction policy for independently sequenced shared viewers.
 pub const MSG_SHARED_SCREEN: u8 = 19;
-pub const SHARED_SCREEN_MAGIC: &[u8; 4] = b"QP1\0";
+// Interpreted as a QS2 decompression-size prefix, this exceeds MAX_SCREEN_RAW,
+// so a valid ordinary datagram can never collide with the shared discriminator.
+pub const SHARED_SCREEN_MAGIC: &[u8; 4] = b"QP1!";
 
 /// Upper bound on certificate hashes in one auth frame.
 pub const MAX_CHAIN_HASHES: usize = 64;
@@ -1368,6 +1370,7 @@ mod tests {
 
     #[test]
     fn shared_screen_metadata_round_trip_and_malformed_policy_rejected() {
+        assert!(u32::from_le_bytes(*SHARED_SCREEN_MAGIC) as usize > MAX_SCREEN_RAW);
         let original = SharedScreen {
             prediction_epoch: 42,
             prediction_allowed: false,
