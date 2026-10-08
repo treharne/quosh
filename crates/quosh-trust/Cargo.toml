@@ -1,0 +1,17 @@
+[package]
+name = "quosh-trust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+rcgen = { version = "0.13", features = ["pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+sha2 = "0.10"
+time = "0.3"
+wtransport = "0.6"
+
+[dev-dependencies]
+rand.workspace = true

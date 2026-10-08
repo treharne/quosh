@@ -12,9 +12,9 @@ use blit_remote::FrameState;
 use quosh_predict::{DisplayPreference, Predictor};
 use quosh_proto::{
     FrameFeed, Hello, HelloOk, MSG_ERROR, MSG_EXIT, MSG_HELLO_OK, MSG_INPUT_ACK, MSG_PONG,
-    MSG_SCREEN, OUTAGE_BANNER_SECS, PROTOCOL_VERSION, Screen, decode_error, decode_exit,
-    decode_u64, encode_ack_state, encode_hangup, encode_input, encode_ping, encode_resize,
-    split_frame,
+    MSG_SCREEN, MSG_SHARED_SCREEN, OUTAGE_BANNER_SECS, PROTOCOL_VERSION, SHARED_SCREEN_MAGIC,
+    Screen, SharedScreen, decode_error, decode_exit, decode_u64, encode_ack_state, encode_hangup,
+    encode_input, encode_ping, encode_resize, split_frame,
 };
 use std::time::Duration;
 
@@ -62,6 +62,7 @@ pub struct Client {
     cols: u16,
     rows: u16,
     never: bool,
+    shared_prediction: Option<(u64, bool)>,
 
     // Connection/protocol.
     connected: bool,
@@ -109,6 +110,7 @@ impl Client {
             cols,
             rows,
             never: predict_never,
+            shared_prediction: None,
             connected: false,
             hello_ok: false,
             feed: FrameFeed::default(),
@@ -253,7 +255,15 @@ impl Client {
                 }
                 self.hello_ok = true;
             }
+            MSG_SHARED_SCREEN => {
+                let screen = SharedScreen::decode_compressed(payload)
+                    .map_err(|e| ClientError::Fatal(format!("invalid shared screen: {e}")))?;
+                self.apply_shared_screen(screen, now_ms)?;
+            }
             MSG_SCREEN => {
+                if self.shared_prediction.is_some() {
+                    return Err(ClientError::Fatal("shared screen metadata missing".into()));
+                }
                 if let Ok(s) = Screen::decode_compressed(payload) {
                     self.apply_screen(s, now_ms);
                 }
@@ -295,9 +305,45 @@ impl Client {
 
     pub fn recv_datagram(&mut self, bytes: &[u8], now_ms: u64) {
         self.last_rx_ms = Some(now_ms);
-        if let Ok(s) = Screen::decode_compressed(bytes) {
+        if bytes.starts_with(SHARED_SCREEN_MAGIC) {
+            if let Ok(s) = SharedScreen::decode_compressed(bytes) {
+                let _ = self.apply_shared_screen(s, now_ms);
+            }
+        } else if self.shared_prediction.is_none()
+            && let Ok(s) = Screen::decode_compressed(bytes)
+        {
             self.apply_screen(s, now_ms);
         }
+    }
+
+    fn apply_shared_screen(
+        &mut self,
+        incoming: SharedScreen,
+        now_ms: u64,
+    ) -> Result<(), ClientError> {
+        let Some(screen) = Screen::apply_newer(self.confirmed.as_ref(), incoming.screen) else {
+            return Ok(());
+        };
+        if self
+            .shared_prediction
+            .is_some_and(|(epoch, _)| incoming.prediction_epoch < epoch)
+        {
+            return Err(ClientError::Fatal("prediction epoch regressed".into()));
+        }
+        let context = (incoming.prediction_epoch, incoming.prediction_allowed);
+        if self.shared_prediction != Some(context) {
+            self.predictor.reset();
+            // Do not replay speculative keystrokes against the changed basis.
+            self.predictor
+                .set_display_preference(if self.never || !context.1 {
+                    DisplayPreference::Never
+                } else {
+                    DisplayPreference::Adaptive
+                });
+            self.shared_prediction = Some(context);
+        }
+        self.apply_screen(screen, now_ms);
+        Ok(())
     }
 
     fn apply_screen(&mut self, incoming: Screen, now_ms: u64) {
@@ -320,6 +366,9 @@ impl Client {
     }
 
     fn feed_predict(&mut self, seq: u64, bytes: &[u8], now_ms: u64) {
+        if self.shared_prediction.is_some_and(|(_, allowed)| !allowed) {
+            return;
+        }
         if bytes.len() > PASTE_BYTES {
             // Bulk input is not predicted; drop any stale overlay immediately.
             self.predictor.reset();
@@ -569,6 +618,89 @@ mod tests {
         c.queue_input(vec![b'a'; PASTE_BYTES + 1], 0);
         // No prediction: the display stays the confirmed frame.
         assert_eq!(c.display().unwrap().cursor_col(), 2);
+    }
+
+    fn shared(version: u64, epoch: u64, allowed: bool, text: &str) -> Vec<u8> {
+        SharedScreen {
+            prediction_epoch: epoch,
+            prediction_allowed: allowed,
+            screen: Screen {
+                version,
+                echo_ack: 0,
+                frame: text_frame(&[text], 0, text.len() as u16),
+            },
+        }
+        .encode_compressed()
+        .unwrap()
+    }
+
+    #[test]
+    fn foreign_context_removes_overlays_without_dropping_unacked_input() {
+        let mut c = Client::new([0; 16], [0; 32], 80, 24, false);
+        c.recv_datagram(&shared(1, 1, true, "hi"), 0);
+        c.predictor
+            .set_display_preference(DisplayPreference::Always);
+        c.queue_input(b"x".to_vec(), 1);
+        assert!(c.predictor.active());
+        c.recv_control(
+            &encode_frame(MSG_SHARED_SCREEN, &shared(2, 2, false, "foreign")),
+            2,
+        )
+        .unwrap();
+        assert!(!c.predictor.active());
+        assert_eq!(c.unacked_bytes(), 1);
+        assert_eq!(c.display(), c.confirmed());
+        c.queue_input(b"y".to_vec(), 3);
+        assert!(!c.predictor.active());
+        c.recv_datagram(&shared(3, 3, true, "foreign"), 4);
+        assert!(
+            !c.predictor.active(),
+            "old unacked input must not be speculatively replayed"
+        );
+        assert_eq!(c.unacked_bytes(), 2);
+    }
+
+    #[test]
+    fn reordered_datagram_cannot_restore_prediction_or_old_geometry() {
+        let mut c = Client::new([0; 16], [0; 32], 80, 24, false);
+        c.recv_control(
+            &encode_frame(MSG_SHARED_SCREEN, &shared(2, 2, false, "new")),
+            0,
+        )
+        .unwrap();
+        c.recv_datagram(&shared(1, 1, true, "old"), 1);
+        assert_eq!(c.shared_prediction, Some((2, false)));
+        assert_eq!(c.confirmed().unwrap().cell_content(0, 0), "n");
+        assert!(
+            c.recv_control(
+                &encode_frame(MSG_SHARED_SCREEN, &shared(3, 1, true, "bad")),
+                2
+            )
+            .is_err()
+        );
+        assert_eq!(c.shared_prediction, Some((2, false)));
+        assert_eq!(c.confirmed().unwrap().cell_content(0, 0), "n");
+    }
+
+    #[test]
+    fn shared_mode_never_accepts_unannotated_screens_and_preserves_user_never() {
+        let mut c = Client::new([0; 16], [0; 32], 80, 24, true);
+        c.recv_datagram(&shared(1, 1, true, "hi"), 0);
+        c.queue_input(b"x".to_vec(), 1);
+        assert_eq!(c.display(), c.confirmed());
+        let ordinary = Screen {
+            version: 2,
+            echo_ack: 0,
+            frame: text_frame(&["wrong"], 0, 0),
+        }
+        .encode_compressed()
+        .unwrap();
+        c.recv_datagram(&ordinary, 2);
+        assert_eq!(c.confirmed().unwrap().cell_content(0, 0), "h");
+        assert!(
+            c.recv_control(&encode_frame(MSG_SCREEN, &ordinary), 2)
+                .is_err()
+        );
     }
 
     #[test]

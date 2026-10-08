@@ -38,6 +38,11 @@ Canonical spec: [docs/11-v1-spec.md](docs/11-v1-spec.md).
   independent of the daemon and network transport.
 - `quosh-pty`: Linux PTY creation and descriptor duplication with atomic
   close-on-exec protection.
+- `quosh-trust`: persisted rotating certificate identity, reusable without
+  Quosh's shell-session daemon.
+
+[Shared-terminal screens](docs/15-shared-terminal-screens.md) carry prediction
+invalidation metadata for consumers such as Sheepdog.
 
 The server retains compatibility exports in `term` and `pty`; the CLI wire
 protocol is unchanged. Sheepdog consumes these libraries directly.

@@ -178,6 +178,9 @@ pub const MSG_ENROLL: u8 = 15;
 pub const MSG_ASSERT: u8 = 16;
 pub const MSG_AUTH_OK: u8 = 17;
 pub const MSG_AUTH_FAIL: u8 = 18;
+/// Screen plus prediction policy for independently sequenced shared viewers.
+pub const MSG_SHARED_SCREEN: u8 = 19;
+pub const SHARED_SCREEN_MAGIC: &[u8; 4] = b"QP1\0";
 
 /// Upper bound on certificate hashes in one auth frame.
 pub const MAX_CHAIN_HASHES: usize = 64;
@@ -423,6 +426,51 @@ pub struct Screen {
     pub version: u64,
     pub echo_ack: u64,
     pub frame: FrameState,
+}
+
+/// Prediction invalidation belongs to the screen, not a separate message that
+/// could race a streamed or datagram state update. Ordinary QS2 stays unchanged.
+#[derive(Clone, Debug)]
+pub struct SharedScreen {
+    pub prediction_epoch: u64,
+    pub prediction_allowed: bool,
+    pub screen: Screen,
+}
+
+impl SharedScreen {
+    pub fn encode_compressed(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(SHARED_SCREEN_MAGIC);
+        bytes.extend_from_slice(&self.prediction_epoch.to_le_bytes());
+        bytes.push(u8::from(self.prediction_allowed));
+        bytes.extend_from_slice(&self.screen.encode_compressed()?);
+        if bytes.len() + 1 > MAX_FRAME {
+            return Err(Error::TooLarge);
+        }
+        Ok(bytes)
+    }
+
+    pub fn decode_compressed(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 13 {
+            return Err(Error::Truncated);
+        }
+        if bytes.len() + 1 > MAX_FRAME {
+            return Err(Error::TooLarge);
+        }
+        if &bytes[..4] != SHARED_SCREEN_MAGIC {
+            return Err(Error::Magic);
+        }
+        let prediction_allowed = match bytes[12] {
+            0 => false,
+            1 => true,
+            _ => return Err(Error::Frame),
+        };
+        Ok(Self {
+            prediction_epoch: u64::from_le_bytes(bytes[4..12].try_into().unwrap()),
+            prediction_allowed,
+            screen: Screen::decode_compressed(&bytes[13..])?,
+        })
+    }
 }
 
 impl Screen {
@@ -1316,6 +1364,35 @@ mod tests {
         let ansi = frame_ansi(&frame);
         let spaces = ansi.iter().filter(|&&b| b == b' ').count();
         assert_eq!(spaces, 4);
+    }
+
+    #[test]
+    fn shared_screen_metadata_round_trip_and_malformed_policy_rejected() {
+        let original = SharedScreen {
+            prediction_epoch: 42,
+            prediction_allowed: false,
+            screen: Screen {
+                version: 9,
+                echo_ack: 7,
+                frame: FrameState::from_parts(1, 24, 0, 0, 1, "", vec![0; 24 * CELL_SIZE]),
+            },
+        };
+        let encoded = original.encode_compressed().unwrap();
+        let decoded = SharedScreen::decode_compressed(&encoded).unwrap();
+        assert_eq!(decoded.prediction_epoch, 42);
+        assert!(!decoded.prediction_allowed);
+        assert_eq!(decoded.screen.version, 9);
+        assert_eq!(decoded.screen.echo_ack, 7);
+        assert_eq!(decoded.screen.frame, original.screen.frame);
+        let mut bad = encoded.clone();
+        bad[12] = 2;
+        assert!(matches!(
+            SharedScreen::decode_compressed(&bad),
+            Err(Error::Frame)
+        ));
+        for length in 0..encoded.len() {
+            assert!(SharedScreen::decode_compressed(&encoded[..length]).is_err());
+        }
     }
 
     #[test]
